@@ -1,0 +1,19 @@
+# Secrets
+.env
+*.env
+
+# Mac
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Pipeline state / cache
+seen_jobs.json
+job_scout_camila/seen_jobs_camila.json
+
+# Exports (contiennent tes candidatures, potentiellement sensible)
+*.xlsx
+job_scout_camila/*.xlsx
