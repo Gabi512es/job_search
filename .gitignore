@@ -13,6 +13,7 @@ __pycache__/
 # Pipeline state / cache
 seen_jobs.json
 job_scout_camila/seen_jobs_camila.json
+job_scout_camila/infojobs_raw_dump.json
 
 # Exports (contiennent tes candidatures, potentiellement sensible)
 *.xlsx
