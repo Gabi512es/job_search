@@ -18,3 +18,25 @@ job_scout_camila/infojobs_raw_dump.json
 # Exports (contiennent tes candidatures, potentiellement sensible)
 *.xlsx
 job_scout_camila/*.xlsx
+
+# User profiles and CVs — real personal data, never versioned.
+# Only the fictional example profile is tracked, as schema documentation.
+profiles/*
+!profiles/example.json
+!profiles/README.md
+
+# Legacy CV location (moved to profiles/cv/)
+job_scout_camila/camila_cv_context.txt
+
+# Raw connector dumps — paid Apify payloads, replayable at zero cost
+dumps/
+
+# Local JsonStore data — real results, one directory per user
+store_data/
+
+# Frozen original notebooks, kept as the differential tests' reference.
+# Not versioned: they still contain the candidate's name in the
+# cover-letter prompt.
+legacy/*
+!legacy/README.md
+exports/

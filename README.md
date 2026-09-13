@@ -67,17 +67,27 @@ https://www.linkedin.com/jobs/search/?keywords=AI+engineer+python&location=Europ
 
 ## ⚠️ LinkedIn RSS : Workaround requis
 
-LinkedIn a progressivement restreint ses flux RSS. Deux options pour les débloquer :
+LinkedIn a progressivement restreint ses flux RSS. Options pour les débloquer :
 
-### Option A — Cookie de session (recommandé)
-1. Loggue-toi sur linkedin.com dans ton navigateur
-2. Ouvre DevTools → Application → Cookies → copie la valeur de `li_at`
-3. Dans le script, ajoute ce header dans `parse_feeds` :
-```python
-feedparser.USER_AGENT = "Mozilla/5.0 ..."
-# Ajoute dans feedparser.parse() :
-feed = feedparser.parse(feed_url, request_headers={"Cookie": "li_at=TON_COOKIE_ICI"})
-```
+### ❌ Cookie de session (`li_at` / `JSESSIONID`) — ESSAYÉ, ABANDONNÉ. NE PAS RÉINTRODUIRE.
+
+Cette approche a été implémentée puis retirée (audit du 09/09/2026). Ce qui a été
+constaté dans le code avant suppression :
+
+- Le header `Cookie: li_at=…; JSESSIONID=…` était injecté dans le dict `request_headers`
+  **générique** de la boucle `parse_feeds`, donc envoyé à **toutes** les URLs de `RSS_FEEDS`.
+- Or `RSS_FEEDS` ne contenait **aucune URL `linkedin.com`** : le cookie n'atteignait jamais
+  LinkedIn et ne débloquait donc rien du tout.
+- En revanche il divulguait un identifiant de session LinkedIn (= accès authentifié complet
+  au compte) à 5 hôtes tiers sans aucun usage pour lui : weworkremotely.com, hnrss.org,
+  arbeitnow.com, remotive.com, jobicy.com.
+- Aucune détection d'expiration n'était possible : le check `✅` de la cellule Config
+  testait seulement que la variable d'environnement était non vide.
+
+Si un accès LinkedIn RSS authentifié redevient nécessaire un jour, c'est un chantier à part
+entière : il faut de vraies URLs de flux `linkedin.com` **et** un header ciblé par hôte
+(jamais un header global), pas la réintroduction de ce mécanisme. En attendant, LinkedIn
+passe par Apify (voir Option C, c'est ce qui est en place).
 
 ### Option B — Sources RSS alternatives (sans login, toujours dispo)
 Le script inclut déjà Remotive et We Work Remotely comme fallback. Tu peux aussi ajouter :

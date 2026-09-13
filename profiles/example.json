@@ -1,0 +1,117 @@
+{
+  "profile_id": "example",
+  "display_name": "Example Candidate",
+  "language": "en",
+  "cv_text": "Fictional candidate. Replace with your own CV text or use cv_path.",
+  "candidate_summary": "Fictional profile, committed as schema documentation only.",
+  "dimensions": [
+    {
+      "key": "role_fit",
+      "label": "Role",
+      "weight": 0.6,
+      "rubric": "9-10: exact role match\n5-6: adjacent role\n0-2: unrelated"
+    },
+    {
+      "key": "location",
+      "label": "Loc",
+      "weight": 0.4,
+      "rubric": "9-10: target city\n5-6: remote\n0-2: elsewhere"
+    }
+  ],
+  "thresholds": {
+    "yes_above": 7.0,
+    "maybe_above": 5.0
+  },
+  "verdict_labels": {
+    "yes": "YES",
+    "maybe": "MAYBE",
+    "no": "NO"
+  },
+  "llm_flags": [
+    {
+      "key": "requires_license",
+      "definition": "true if a mandatory licence is stated",
+      "adjustment": -2.0,
+      "note": "licence required",
+      "target": "red_flags"
+    }
+  ],
+  "keyword_penalties": [
+    {
+      "key": "hard_commute",
+      "keywords": [
+        "far town"
+      ],
+      "fields": [
+        "location"
+      ],
+      "adjustment": -1.5,
+      "note": "difficult commute"
+    }
+  ],
+  "exclusions": [
+    {
+      "kind": "any_keyword",
+      "fields": [
+        "title",
+        "company"
+      ],
+      "keywords": [
+        "internship"
+      ]
+    }
+  ],
+  "extra_output_fields": [],
+  "target_salary_rule": null,
+  "sources": [
+    {
+      "type": "rss",
+      "enabled": true,
+      "feeds": [
+        "https://hnrss.org/jobs"
+      ]
+    },
+    {
+      "type": "linkedin_apify",
+      "enabled": false
+    },
+    {
+      "type": "infojobs_apify",
+      "enabled": false
+    },
+    {
+      "type": "xarxanet",
+      "enabled": false
+    }
+  ],
+  "writing": null,
+  "export": {
+    "sheets": [
+      {
+        "name": "Results",
+        "columns": [
+          {
+            "label": "Verdict",
+            "width": 12,
+            "value": "computed:verdict_display"
+          },
+          {
+            "label": "Score",
+            "width": 7,
+            "value": "field:score"
+          },
+          {
+            "label": "Title",
+            "width": 35,
+            "value": "field:title"
+          },
+          {
+            "label": "URL",
+            "width": 55,
+            "value": "field:url"
+          }
+        ]
+      }
+    ]
+  }
+}
