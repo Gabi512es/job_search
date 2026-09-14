@@ -76,8 +76,12 @@ create table if not exists public.runs (
     counts            jsonb not null default '{}'::jsonb,
     created_at        timestamptz not null default now(),
 
+    -- RUNNING and FAILED are written by the HTTP API, which records a run
+    -- before starting it so that a poll has something to read, and marks it
+    -- failed if the background task raises.
     constraint runs_status_valid check (
-        status in ('', 'OK', 'NEEDS_CONFIRMATION', 'REJECTED_OVER_HARD_CAP')
+        status in ('', 'RUNNING', 'OK', 'NEEDS_CONFIRMATION',
+                   'REJECTED_OVER_HARD_CAP', 'FAILED')
     )
 );
 

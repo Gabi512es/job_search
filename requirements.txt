@@ -13,3 +13,7 @@ openpyxl>=3.1.0
 
 # Persistence — optional. JsonStore needs nothing; SupabaseStore needs this.
 supabase>=2.0.0
+
+# HTTP API (api.py) — needed to deploy, not to use the engine as a library
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0

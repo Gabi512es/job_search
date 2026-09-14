@@ -118,6 +118,7 @@ def run(
     cv_text: str | None = None,
     client: Any = None,
     repo_dir: Path | str = ".",
+    run_id: str | None = None,
 ) -> RunReport:
     """Execute one job search.
 
@@ -127,7 +128,9 @@ def run(
     """
     opts = opts or RunOptions()
     user_id = user_id or profile.profile_id
-    run_id = uuid.uuid4().hex[:12]
+    # Supplied by the HTTP API, which must return the id before the work
+    # starts; generated here for direct callers.
+    run_id = run_id or uuid.uuid4().hex[:12]
     started = datetime.now().isoformat()
 
     cv_text = cv_text if cv_text is not None else profile.load_cv(Path(repo_dir))
