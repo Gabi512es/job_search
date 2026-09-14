@@ -4,7 +4,8 @@
 > mono-utilisateur en un moteur backend réutilisable, appelable depuis une
 > application web (frontend Lovable + Supabase).
 >
-> **Statut** : architecture validée le 09/09/2026. Les 6 blocs sont implémentés.
+> **Statut** : les 6 blocs sont implémentés et validés sur un run réel.
+> Schéma Supabase + `SupabaseStore` écrits, en attente d'un projet réel.
 > **Antériorité** : issu de l'audit du code existant (même date), dont les
 > constats sont repris ici sans être recopiés intégralement.
 
@@ -90,7 +91,7 @@ jobscout/
   store/                                                              [FAIT]
     base.py           # Protocol Store + JobResult / Application / RunRecord
     json_store.py     # développement : fichiers locaux
-    supabase_store.py # coquille explicite, lève NotImplementedError
+    supabase_store.py # implémenté                                   [FAIT]
 tools/
   build_profiles.py   # adaptateur notebooks -> profiles/*.json          [FAIT]
 profiles/             # GITIGNORÉ sauf example.json et README.md         [FAIT]
@@ -107,6 +108,9 @@ tests/
   test_scoring.py              # différentiel sur 999 lignes réelles     [FAIT]
   test_store_export.py         # store, mapping job_results, export      [FAIT]
   test_pipeline.py             # run() complet, client factice           [FAIT]
+  test_supabase_store.py       # SQL + logique, client factice           [FAIT]
+supabase/
+  schema.sql          # 6 tables + RLS, à appliquer une fois   [FAIT]
 legacy/               # GITIGNORÉ — notebooks d'origine figés (référence)
 dumps/                # GITIGNORÉ — payloads Apify bruts, rejouables     [FAIT]
 ```
@@ -865,3 +869,75 @@ par `tests/legacy_values.py` :
 mais le commit `8e73fec` contient toujours le CV de Camila et le profil de
 Gabriel. Purger l'historique demande une réécriture (`git filter-repo` ou BFG),
 qui réécrit tous les hash de commits. À décider séparément.
+
+---
+
+## 9. Supabase — schéma, RLS et `SupabaseStore`
+
+Le SQL complet est dans `supabase/schema.sql`, idempotent, à appliquer une fois
+dans l'éditeur SQL du projet. `jobscout/store/supabase_store.py` implémente le
+même `Protocol` que `JsonStore` ; les deux coexistent.
+
+### 9.1 Modèle de sécurité — le point à comprendre
+
+| Qui | Clé utilisée | RLS |
+|---|---|---|
+| Le backend (ce moteur) | `SUPABASE_SERVICE_ROLE_KEY` | **contournée** |
+| Le frontend Lovable | clé `anon` + JWT de l'utilisateur | **appliquée par Postgres** |
+
+Le backend exécute des runs *pour le compte d'un* utilisateur, hors de toute
+session navigateur : il lui faut donc la clé service-role, qui ignore la RLS.
+**L'isolation entre utilisateurs dans ce processus repose donc sur le filtre
+`user_id` présent dans chaque requête Python, pas sur la base.**
+
+C'est un arbitrage assumé, avec une arête vive : un filtre oublié ferait fuiter
+les résultats d'un utilisateur vers un autre. Trois garde-fous en conséquence :
+
+1. Chaque méthode filtre explicitement sur `user_id`.
+2. `_guard()` refuse un `user_id` vide — avec la clé service-role, un filtre
+   vide ne renverrait pas « aucun résultat » mais « les résultats de tout le
+   monde ».
+3. Les écritures vérifient l'appartenance de **tout le lot** avant d'écrire
+   quoi que ce soit, dans cet ordre précis (le bug corrigé au bloc 5).
+
+La RLS n'est pas décorative pour autant : c'est elle qui protège le frontend,
+qui lui se connecte avec la clé `anon` et le JWT de l'utilisateur.
+
+`SupabaseStore(url, anon_key, access_token=jwt)` fonctionne aussi, et dans ce
+cas Postgres applique la RLS en plus des filtres Python.
+
+### 9.2 Ce que la RLS garantit
+
+Une policy par table, couvrant les quatre commandes, avec `using` (quelles
+lignes sont visibles) **et** `with check` (quelles lignes peuvent être écrites).
+Séparer les deux est ce qui empêche un utilisateur d'insérer une ligne
+appartenant à quelqu'un d'autre. `force row level security` l'applique aussi au
+propriétaire de la table, pour qu'une erreur ne soit pas masquée par un accès
+privilégié pendant le développement. Rien n'est accordé à `anon` : un visiteur
+non authentifié ne voit aucune ligne.
+
+### 9.3 Variables d'environnement
+
+```
+SUPABASE_URL                https://<ref>.supabase.co
+SUPABASE_SERVICE_ROLE_KEY   côté serveur uniquement, jamais dans le frontend
+SUPABASE_ANON_KEY           pour le frontend, ou avec un access_token utilisateur
+```
+
+Aucune n'est en dur dans le code, comme pour `ANTHROPIC_API_KEY` et
+`APIFY_TOKEN`.
+
+### 9.4 Reste à valider sur un projet réel
+
+Le test couvre 103 points hors-ligne, mais six choses ne peuvent pas être
+prouvées sans projet :
+
+1. Que le SQL s'applique effectivement (il est vérifié comme texte, jamais exécuté).
+2. **Que la RLS isole réellement deux utilisateurs** — la vérification la plus
+   importante : deux comptes, chacun interrogeant avec son propre JWT.
+3. Que `upsert(..., ignore_duplicates=True)` ne renvoie que les lignes réellement
+   insérées, ce sur quoi `save_results()` compte pour son retour.
+4. Que la syntaxe de jointure `job_results!inner(url)` renvoie la forme imbriquée
+   attendue par `get_applications()`.
+5. La gestion des horodatages : `timestamptz` en entrée, chaîne ISO en sortie.
+6. Le comportement réseau réel : délais, réessais, limites de débit.

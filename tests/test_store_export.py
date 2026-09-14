@@ -157,16 +157,29 @@ check("a later run does not touch the application",
 check("nor its notes",
       store.get_applications("u1")["https://x/1"].notes, "RDV mardi")
 
-section("STORE — SupabaseStore is an explicit shell")
+section("STORE — JsonStore and SupabaseStore are interchangeable")
 
-for method, args in (("seen_keys", ("u1",)), ("known_urls", ("u1",)),
-                     ("save_results", ("u1", [])), ("get_results", ("u1",))):
-    raised = False
-    try:
-        getattr(SupabaseStore(), method)(*args)
-    except NotImplementedError:
-        raised = True
-    check(f"SupabaseStore.{method} raises rather than silently passing", raised, True)
+# SupabaseStore was a shell at block 5 and is implemented now; its own
+# behaviour is covered by tests/test_supabase_store.py. What matters here is
+# that the two remain substitutable, and that the Supabase one cannot be
+# constructed by accident without credentials.
+import inspect  # noqa: E402
+
+json_methods = sorted(m for m in dir(JsonStore)
+                      if not m.startswith("_") and callable(getattr(JsonStore, m)))
+check("SupabaseStore implements every JsonStore method",
+      [m for m in json_methods if not hasattr(SupabaseStore, m)], [])
+check("with identical signatures",
+      [m for m in json_methods
+       if list(inspect.signature(getattr(JsonStore, m)).parameters)
+       != list(inspect.signature(getattr(SupabaseStore, m)).parameters)], [])
+
+raised = False
+try:
+    SupabaseStore("", "")
+except Exception as exc:
+    raised = "SUPABASE_URL" in str(exc)
+check("SupabaseStore refuses to build without credentials", raised, True)
 
 
 # ===========================================================================

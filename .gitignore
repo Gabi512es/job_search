@@ -40,3 +40,4 @@ store_data/
 legacy/*
 !legacy/README.md
 exports/
+example_data/
