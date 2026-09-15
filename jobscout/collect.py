@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from jobscout.connectors import Secrets, SourceConnector, build_connectors
 from jobscout.filters import apply_exclusions, deduplicate, filter_new
@@ -63,6 +64,7 @@ def collect(
     secrets: Secrets,
     *,
     seen_keys: set[str] | None = None,
+    seen_among: Callable[[set[str]], set[str]] | None = None,
     confirmed_fingerprint: str | None = None,
     dumps_dir: Path | str = "dumps",
 ) -> CollectionResult:
@@ -99,7 +101,15 @@ def collect(
     counts["excluded"] = sum(excluded.values())
     counts.update({f"excl_{k}": v for k, v in excluded.items()})
 
-    if seen_keys:
+    # Asking "which of these candidates are known" beats pulling the whole
+    # cache down: it is the only form the Lovable route can answer, and it
+    # stays cheap as the cache grows.
+    if seen_among is not None:
+        already = seen_among({j.key for j in jobs})
+        before = len(jobs)
+        jobs = [j for j in jobs if j.key not in already]
+        counts["already_seen"] = before - len(jobs)
+    elif seen_keys:
         jobs, n_seen = filter_new(jobs, seen_keys)
         counts["already_seen"] = n_seen
 

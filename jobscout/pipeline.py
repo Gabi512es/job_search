@@ -136,10 +136,15 @@ def run(
     cv_text = cv_text if cv_text is not None else profile.load_cv(Path(repo_dir))
 
     # ---- 1. collect: plan -> cost guard -> fetch -------------------------
-    seen = store.seen_keys(user_id) if opts.use_seen_cache else set()
+    # Bound to the store rather than materialised: the Lovable backend cannot
+    # enumerate its seen-jobs cache, only answer "which of these do you know".
+    seen_among = (
+        (lambda keys: store.seen_among(user_id, keys))
+        if opts.use_seen_cache else None
+    )
     collection = collect(
         profile, secrets,
-        seen_keys=seen,
+        seen_among=seen_among,
         confirmed_fingerprint=opts.confirmed_fingerprint,
         dumps_dir=opts.dumps_dir,
     )

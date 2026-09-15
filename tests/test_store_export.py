@@ -174,12 +174,14 @@ check("with identical signatures",
        if list(inspect.signature(getattr(JsonStore, m)).parameters)
        != list(inspect.signature(getattr(SupabaseStore, m)).parameters)], [])
 
+# The store now speaks HTTP to Lovable's engine routes rather than Postgres,
+# so the credential it refuses to start without is ENGINE_API_KEY.
 raised = False
 try:
     SupabaseStore("", "")
 except Exception as exc:
-    raised = "SUPABASE_URL" in str(exc)
-check("SupabaseStore refuses to build without credentials", raised, True)
+    raised = "ENGINE_API_KEY" in str(exc)
+check("the engine store refuses to build without credentials", raised, True)
 
 
 # ===========================================================================

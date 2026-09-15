@@ -108,12 +108,16 @@ def get_store():
     """The Store implementation this deployment uses.
 
     JsonStore writes to disk, which on Railway is ephemeral - fine for a first
-    deploy, not for real use. Set STORE_BACKEND=supabase once the schema is
-    applied and the keys are set.
+    deploy, not for real use. Set STORE_BACKEND=lovable to persist through
+    Lovable's engine routes instead; that needs ENGINE_API_KEY.
+
+    Note that the Lovable backend cannot yet serve GET /run/{id} or
+    GET /results: no read route exists for runs or job_results, so those two
+    endpoints raise until Lovable adds them.
     """
-    if STORE_BACKEND == "supabase":
-        from jobscout.store.supabase_store import SupabaseStore
-        return SupabaseStore.from_env()
+    if STORE_BACKEND in ("supabase", "lovable"):
+        from jobscout.store.supabase_store import LovableEngineStore
+        return LovableEngineStore.from_env()
     return JsonStore(STORE_DIR)
 
 

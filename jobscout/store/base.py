@@ -138,6 +138,16 @@ class Store(Protocol):
         """Job keys this user has already been shown."""
         ...
 
+    def seen_among(self, user_id: str, keys: set[str]) -> set[str]:
+        """Which of `keys` this user has already been shown.
+
+        Preferred over seen_keys(): it scales with the number of candidates
+        rather than the size of the cache, and it is the only form a backend
+        that cannot enumerate its cache can answer. LovableEngineStore's route
+        filters on the keys given, so seen_keys() is unimplementable there.
+        """
+        ...
+
     def mark_seen(self, user_id: str, keys: set[str]) -> None:
         ...
 

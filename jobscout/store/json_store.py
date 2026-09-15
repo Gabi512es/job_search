@@ -57,6 +57,13 @@ class JsonStore:
     def seen_keys(self, user_id: str) -> set[str]:
         return set(self._read(user_id, "seen_jobs.json", []))
 
+    def seen_among(self, user_id: str, keys: set[str]) -> set[str]:
+        """Intersection with the stored cache. Trivial here; the HTTP store
+        has to ask the server, which is why this is on the protocol."""
+        if not keys:
+            return set()
+        return self.seen_keys(user_id) & set(keys)
+
     def mark_seen(self, user_id: str, keys: set[str]) -> None:
         merged = self.seen_keys(user_id) | set(keys)
         self._write(user_id, "seen_jobs.json", sorted(merged))
