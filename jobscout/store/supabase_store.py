@@ -9,16 +9,12 @@ routes instead. There is no database connection anywhere in this file.
     ENGINE_API_KEY            sent as X-Engine-Key on every request
     LOVABLE_ENGINE_BASE_URL   defaults to the production project URL
 
-Six routes are wired: the original five plus get-run. They cover five of the
-nine Store methods; the rest are handled as follows, and the reasoning matters
-more than the code:
+Seven routes are wired: the original five plus get-run and get-job-results.
+They cover eight of the nine Store methods; the rest are handled as follows,
+and the reasoning matters more than the code:
 
-    known_urls        returns empty, with one warning. Degradation only:
-                      deduplication runs primarily on job_key via seen-jobs,
-                      and this is the belt-and-braces URL check on top.
     get_applications  returns empty. Only the Excel Tracker reads it, which
-                      then shows profile defaults.
-    get_results       RAISES. Returning [] would look like "this user has no
+                      then shows profile defaults. Returning [] would look like "this user has no
                       offers", which is worse than an error.
     save_application  RAISES. Silently dropping what a user typed is the one
                       failure this design exists to prevent.
@@ -52,6 +48,14 @@ DEV_BASE_URL = (
 # A job_results row carries a full cover letter (~3.5 kB), so 250 rows would be
 # a megabyte in one body. Chunked to keep each request small.
 RESULTS_CHUNK = 50
+
+# The most get-job-results will return. MEASURED 2026-09-16: the route rejects
+# anything above 500 with {"error": "limit must be a number between 1 and 500"},
+# and offset/cursor/page/skip are all silently ignored, so there is no way to
+# page past it. Hitting the ceiling is treated as an error rather than silently
+# working with a partial set: for known_urls, a missing URL means a posting is
+# scored and billed twice.
+RESULTS_LIMIT = 500
 
 REQUEST_TIMEOUT = 30.0
 # Retries only on transient failures, and only because every write route is an
@@ -263,20 +267,33 @@ class LovableEngineStore:
     # -- job_results --------------------------------------------------------
 
     def known_urls(self, user_id: str) -> set[str]:
-        """No route exposes this. Returns empty, once with a warning.
+        """Every URL already stored for this user, read through get-job-results.
 
-        Deduplication still works: collect() filters on job_key through
-        seen-jobs before anything is scored. This check only catches the case
-        where the job_key changed but the URL did not, so losing it costs a
-        small amount of re-scoring rather than correctness.
+        This is the second deduplication gate: collect() filters on job_key
+        first, and this catches a posting whose key changed but whose URL did
+        not. Under-reporting here means re-scoring, which costs money, so a
+        truncated page is treated as a loud problem rather than a smaller set.
+
+        It pulls whole rows because the route returns whole rows, cover letters
+        included, and it is capped at 500 with no pagination. That is fine
+        today - a run produces tens of results - but it is a hard ceiling: past
+        500 stored results this raises rather than under-reporting.
         """
-        self._guard(user_id)
-        if not self._warned_known_urls:
-            self._warned_known_urls = True
-            print("  [store] known_urls is unavailable: no Lovable route exposes "
-                  "the stored URLs. Deduplication falls back to job_key alone, "
-                  "which may re-score a posting whose key changed.")
-        return set()
+        user_id = self._guard(user_id)
+        rows = self._fetch_results(user_id, limit=RESULTS_LIMIT)
+        if len(rows) >= RESULTS_LIMIT:
+            # At the ceiling, so there are probably more that were not
+            # returned. Every missing URL is a posting that gets scored again.
+            raise EngineStoreError(
+                f"known_urls: get-job-results returned {len(rows)} rows, the "
+                f"maximum the route allows. There are almost certainly more, "
+                f"and the ones it left out would be scored and billed again. "
+                f"The route caps limit at {RESULTS_LIMIT} and ignores "
+                f"offset/cursor/page, so this cannot be paged around: ask "
+                f"Lovable to raise the cap, add pagination, or expose a "
+                f"url-only variant."
+            )
+        return {r["url"] for r in rows if isinstance(r, dict) and r.get("url")}
 
     def save_results(self, user_id: str, results: list[JobResult]) -> int:
         """Upsert on (user_id, url), server-side. Returns what the route reports.
@@ -314,16 +331,33 @@ class LovableEngineStore:
                 else len(body.get("results") or [])
         return inserted
 
+    def _fetch_results(
+        self, user_id: str, verdicts: list[Verdict] | None = None,
+        limit: int | None = None,
+    ) -> list[dict]:
+        """Raw rows from get-job-results. Optional fields are omitted entirely
+        rather than sent as null, so the route applies its own defaults."""
+        payload: dict[str, Any] = {"user_id": user_id}
+        if verdicts:
+            payload["verdicts"] = list(verdicts)
+        if limit is not None:
+            payload["limit"] = limit
+        body = self._post("get-job-results", payload)
+        rows = body.get("results")
+        if not isinstance(rows, list):
+            raise EngineStoreError(
+                f"get-job-results: expected a 'results' list, got "
+                f"{type(rows).__name__}"
+            )
+        return rows
+
     def get_results(
         self, user_id: str, verdicts: list[Verdict] | None = None
     ) -> list[JobResult]:
-        raise MissingRouteError(
-            "Reading job_results back is not possible: Lovable exposes no "
-            "read route for them. The frontend queries its own Supabase "
-            "directly, so this is only needed by the engine's own "
-            "GET /results endpoint. Ask Lovable for "
-            "POST /api/public/engine/get-job-results {user_id, verdicts?, limit?}."
-        )
+        user_id = self._guard(user_id)
+        rows = self._fetch_results(user_id, verdicts=verdicts,
+                                   limit=RESULTS_LIMIT)
+        return [_from_row(r) for r in rows if isinstance(r, dict)]
 
     # -- runs ---------------------------------------------------------------
 
@@ -445,6 +479,29 @@ def _to_payload(result: JobResult) -> dict:
     payload = {field: row[field] for field in RESULT_FIELDS}
     payload["evaluated_at"] = _clean(payload["evaluated_at"])
     return payload
+
+
+def _from_row(row: dict) -> JobResult:
+    """Map one get-job-results row back onto the model.
+
+    Tolerant of nulls: Postgres returns null where the model wants "" or an
+    empty container, and carries columns the model does not have (id,
+    created_at), which are dropped.
+    """
+    payload = {k: v for k, v in row.items() if k in JobResult.model_fields}
+    for key in ("user_id", "run_id", "job_key", "title", "company", "url",
+                "source", "published", "location", "one_liner",
+                "generated_text", "salary_range_market", "evaluated_at"):
+        if payload.get(key) is None:
+            payload[key] = ""
+    for key in ("match_signals", "gaps", "red_flags"):
+        payload[key] = payload.get(key) or []
+    for key in ("breakdown", "flags", "extra"):
+        payload[key] = payload.get(key) or {}
+    for key in ("score", "base_score"):
+        payload[key] = float(payload.get(key) or 0)
+    payload["verdict"] = payload.get("verdict") or "NO"
+    return JobResult.model_validate(payload)
 
 
 def _body_text(response) -> str:

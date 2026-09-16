@@ -301,12 +301,9 @@ check("items_count travels as a number", body["items_count"], 1200)
 section("MISSING ROUTES — degrade or fail, never silently wrong")
 
 store, client = store_with()
-check("known_urls degrades to empty", store.known_urls("u1"), set())
-check("without making a request", client.requests, [])
 check("get_applications degrades to empty", store.get_applications("u1"), {})
 
 for method, args, route_hint in (
-    ("get_results", ("u1",), "get-job-results"),
     ("save_application", (Application(user_id="u1", job_url="https://x/1"),),
      "save-application"),
 ):
@@ -366,6 +363,98 @@ try:
 except EngineStoreError:
     raised = True
 check("get_run rejects a blank user_id", raised, True)
+
+
+section("GET-JOB-RESULTS — known_urls and get_results")
+
+ROW = {
+    "id": "row-uuid", "created_at": "2026-09-16T00:00:00+00:00",
+    "user_id": "u1", "run_id": "run1", "job_key": "k1",
+    "title": "AI Engineer", "company": "Nova", "url": "https://x/1",
+    "source": "hnrss.org", "published": "2026-09-01", "location": "Barcelona",
+    "verdict": "MAYBE", "score": "6.9", "base_score": "8.4",
+    "breakdown": {"tech_fit": 7}, "one_liner": "Decent.",
+    "match_signals": ["Python"], "gaps": [], "red_flags": ["[-1.5] x"],
+    "flags": {"probe": True}, "extra": {"cv_patches": "y"},
+    "generated_text": "", "salary_range_market": "€60k",
+    "evaluated_at": "2026-09-16T10:00:00+00:00",
+}
+
+store, client = store_with({"get-job-results": {"results": [
+    ROW, dict(ROW, url="https://x/2", id="b"), dict(ROW, url="https://x/3", id="c")]}})
+check("known_urls returns every stored URL", store.known_urls("u1"),
+      {"https://x/1", "https://x/2", "https://x/3"})
+check("on the get-job-results route", client.requests[0]["route"], "get-job-results")
+body = client.requests[0]["json"]
+check("asking for this user", body["user_id"], "u1")
+# MEASURED: the route rejects limit > 500 with a 400.
+check("with the maximum the route allows", body["limit"], 500)
+check("and no verdict filter, since every URL counts", "verdicts" in body, False)
+
+# Rows without a url must not become a phantom "" in the set.
+store, client = store_with({"get-job-results": {"results": [
+    ROW, {"user_id": "u1"}, dict(ROW, url=None), "not-a-dict"]}})
+check("rows without a url are skipped", store.known_urls("u1"), {"https://x/1"})
+
+store, client = store_with({"get-job-results": {"results": []}})
+check("a user with nothing stored gets an empty set",
+      store.known_urls("u1"), set())
+
+# Hitting the ceiling means the list is probably truncated, and a truncated
+# known_urls silently re-scores what it omits. That must fail, not degrade.
+store, client = store_with({"get-job-results": {"results": [
+    dict(ROW, url=f"https://x/{i}") for i in range(500)]}})
+raised, message = False, ""
+try:
+    store.known_urls("u1")
+except EngineStoreError as exc:
+    raised, message = True, str(exc)
+check("hitting the limit raises rather than under-reporting", raised, True)
+check("and explains the consequence", "billed again" in message, True)
+check("and that it cannot be paged around", "pagination" in message, True)
+
+section("GET-JOB-RESULTS — row mapping")
+
+store, client = store_with({"get-job-results": {"results": [ROW]}})
+results = store.get_results("u1")
+check("returns JobResult objects", isinstance(results[0], JobResult), True)
+row = results[0]
+check("numeric columns are coerced", (row.score, row.base_score), (6.9, 8.4))
+check("jsonb arrives as a dict", row.breakdown, {"tech_fit": 7})
+check("text[] arrives as a list", row.red_flags, ["[-1.5] x"])
+check("extra survives", row.extra, {"cv_patches": "y"})
+check("db-only columns are dropped", "id" in row.model_dump(), False)
+
+store, client = store_with({"get-job-results": {"results": [{
+    "user_id": "u1", "url": "https://x/1", "verdict": None, "score": None,
+    "title": None, "match_signals": None, "breakdown": None,
+    "run_id": None, "job_key": None, "evaluated_at": None}]}})
+sparse = store.get_results("u1")[0]
+check("NULL verdict defaults to NO", sparse.verdict, "NO")
+check("NULL numerics become 0.0", sparse.score, 0.0)
+check("NULL text becomes ''", sparse.title, "")
+check("NULL arrays become []", sparse.match_signals, [])
+check("NULL jsonb becomes {}", sparse.breakdown, {})
+
+store, client = store_with({"get-job-results": {"results": [ROW]}})
+store.get_results("u1", verdicts=["YES", "MAYBE"])
+check("the verdict filter is forwarded",
+      client.requests[0]["json"]["verdicts"], ["YES", "MAYBE"])
+
+store, client = store_with({"get-job-results": {"no_results_key": []}})
+raised = False
+try:
+    store.get_results("u1")
+except EngineStoreError as exc:
+    raised = "expected a 'results' list" in str(exc)
+check("a malformed response is reported, not silently empty", raised, True)
+
+raised = False
+try:
+    store.get_results("")
+except EngineStoreError:
+    raised = True
+check("get_results rejects a blank user_id", raised, True)
 
 
 section("ERRORS — every failure mode is translated")
