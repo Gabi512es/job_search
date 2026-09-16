@@ -365,7 +365,7 @@ except EngineStoreError:
 check("get_run rejects a blank user_id", raised, True)
 
 
-section("GET-JOB-RESULTS — known_urls and get_results")
+section("GET-KNOWN-URLS — the dedicated deduplication route")
 
 ROW = {
     "id": "row-uuid", "created_at": "2026-09-16T00:00:00+00:00",
@@ -380,38 +380,72 @@ ROW = {
     "evaluated_at": "2026-09-16T10:00:00+00:00",
 }
 
-store, client = store_with({"get-job-results": {"results": [
-    ROW, dict(ROW, url="https://x/2", id="b"), dict(ROW, url="https://x/3", id="c")]}})
-check("known_urls returns every stored URL", store.known_urls("u1"),
+store, client = store_with({"get-known-urls": {
+    "urls": ["https://x/1", "https://x/2", "https://x/3"], "count": 3}})
+check("known_urls returns the set", store.known_urls("u1"),
       {"https://x/1", "https://x/2", "https://x/3"})
-check("on the get-job-results route", client.requests[0]["route"], "get-job-results")
-body = client.requests[0]["json"]
-check("asking for this user", body["user_id"], "u1")
-# MEASURED: the route rejects limit > 500 with a 400.
-check("with the maximum the route allows", body["limit"], 500)
-check("and no verdict filter, since every URL counts", "verdicts" in body, False)
+check("on the dedicated route", client.requests[0]["route"], "get-known-urls")
+check("posting only the user_id", client.requests[0]["json"], {"user_id": "u1"})
+check("and no limit, because the route pages internally",
+      "limit" in client.requests[0]["json"], False)
+check("exactly one request", len(client.requests), 1)
 
-# Rows without a url must not become a phantom "" in the set.
-store, client = store_with({"get-job-results": {"results": [
-    ROW, {"user_id": "u1"}, dict(ROW, url=None), "not-a-dict"]}})
-check("rows without a url are skipped", store.known_urls("u1"), {"https://x/1"})
-
-store, client = store_with({"get-job-results": {"results": []}})
+store, client = store_with({"get-known-urls": {"urls": [], "count": 0}})
 check("a user with nothing stored gets an empty set",
       store.known_urls("u1"), set())
 
-# Hitting the ceiling means the list is probably truncated, and a truncated
-# known_urls silently re-scores what it omits. That must fail, not degrade.
-store, client = store_with({"get-job-results": {"results": [
-    dict(ROW, url=f"https://x/{i}") for i in range(500)]}})
+store, client = store_with({"get-known-urls": {
+    "urls": ["https://x/1", "", None, 42, "https://x/2"], "count": 5}})
+check("blank and non-string entries are dropped",
+      store.known_urls("u1"), {"https://x/1", "https://x/2"})
+
+# The route reports its own count; a count larger than the list means the list
+# was truncated, and every missing URL is a posting billed twice.
+store, client = store_with({"get-known-urls": {
+    "urls": ["https://x/1", "https://x/2"], "count": 900}})
 raised, message = False, ""
 try:
     store.known_urls("u1")
 except EngineStoreError as exc:
     raised, message = True, str(exc)
-check("hitting the limit raises rather than under-reporting", raised, True)
-check("and explains the consequence", "billed again" in message, True)
-check("and that it cannot be paged around", "pagination" in message, True)
+check("a count larger than the list raises", raised, True)
+check("naming the consequence", "billed again" in message, True)
+
+store, client = store_with({"get-known-urls": {
+    "urls": ["https://x/1", "https://x/2"]}})
+check("a missing count is tolerated",
+      store.known_urls("u1"), {"https://x/1", "https://x/2"})
+
+store, client = store_with({"get-known-urls": {"count": 3}})
+raised, message = False, ""
+try:
+    store.known_urls("u1")
+except EngineStoreError as exc:
+    raised, message = True, str(exc)
+check("a response with no 'urls' list raises", raised, True)
+check("rather than silently re-scoring everything",
+      "re-score everything" in message, True)
+
+raised = False
+try:
+    store.known_urls("")
+except EngineStoreError:
+    raised = True
+check("known_urls rejects a blank user_id", raised, True)
+
+check("get-job-results is no longer used for deduplication",
+      [r for r in client.requests if r["route"] == "get-job-results"], [])
+
+
+section("GET-JOB-RESULTS — still serves get_results, whole rows")
+
+store, client = store_with({"get-job-results": {"results": [ROW]}})
+store.get_results("u1")
+check("get_results uses get-job-results",
+      client.requests[0]["route"], "get-job-results")
+check("with the maximum the route allows",
+      client.requests[0]["json"]["limit"], 500)
+
 
 section("GET-JOB-RESULTS — row mapping")
 

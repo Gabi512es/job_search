@@ -9,7 +9,8 @@ routes instead. There is no database connection anywhere in this file.
     ENGINE_API_KEY            sent as X-Engine-Key on every request
     LOVABLE_ENGINE_BASE_URL   defaults to the production project URL
 
-Seven routes are wired: the original five plus get-run and get-job-results.
+Eight routes are wired: the original five plus get-run, get-job-results and
+get-known-urls.
 They cover eight of the nine Store methods; the rest are handled as follows,
 and the reasoning matters more than the code:
 
@@ -52,9 +53,11 @@ RESULTS_CHUNK = 50
 # The most get-job-results will return. MEASURED 2026-09-16: the route rejects
 # anything above 500 with {"error": "limit must be a number between 1 and 500"},
 # and offset/cursor/page/skip are all silently ignored, so there is no way to
-# page past it. Hitting the ceiling is treated as an error rather than silently
-# working with a partial set: for known_urls, a missing URL means a posting is
-# scored and billed twice.
+# page past it.
+#
+# This now only constrains get_results(), which feeds a display. Deduplication
+# moved to the dedicated get-known-urls route, which pages internally - that
+# cap would otherwise have become a hard ceiling after two full runs.
 RESULTS_LIMIT = 500
 
 REQUEST_TIMEOUT = 30.0
@@ -267,33 +270,47 @@ class LovableEngineStore:
     # -- job_results --------------------------------------------------------
 
     def known_urls(self, user_id: str) -> set[str]:
-        """Every URL already stored for this user, read through get-job-results.
+        """Every URL already stored for this user, from the get-known-urls route.
 
         This is the second deduplication gate: collect() filters on job_key
         first, and this catches a posting whose key changed but whose URL did
-        not. Under-reporting here means re-scoring, which costs money, so a
-        truncated page is treated as a loud problem rather than a smaller set.
+        not. Under-reporting here means re-scoring, which costs money.
 
-        It pulls whole rows because the route returns whole rows, cover letters
-        included, and it is capped at 500 with no pagination. That is fine
-        today - a run produces tens of results - but it is a hard ceiling: past
-        500 stored results this raises rather than under-reporting.
+        The dedicated route exists because get-job-results caps at 500 with no
+        pagination, which would have become a hard ceiling after two full runs.
+        It pages internally and returns the complete list, and it returns bare
+        strings rather than whole rows - no cover letters pulled down just to
+        read the URLs off them.
+
+        MEASURED 2026-09-16 against -dev with 20 stored results: the body has
+        exactly two keys, 'urls' (list of 20 strings) and 'count' (20), and
+        those URLs match the ones get-job-results reports for the same user.
+        The field is 'urls', not 'known_urls'. An unknown user_id gives a JSON
+        404 {"error": "Unknown user_id"}; a missing one gives a 400.
         """
         user_id = self._guard(user_id)
-        rows = self._fetch_results(user_id, limit=RESULTS_LIMIT)
-        if len(rows) >= RESULTS_LIMIT:
-            # At the ceiling, so there are probably more that were not
-            # returned. Every missing URL is a posting that gets scored again.
+        body = self._post("get-known-urls", {"user_id": user_id})
+
+        urls = body.get("urls")
+        if not isinstance(urls, list):
             raise EngineStoreError(
-                f"known_urls: get-job-results returned {len(rows)} rows, the "
-                f"maximum the route allows. There are almost certainly more, "
-                f"and the ones it left out would be scored and billed again. "
-                f"The route caps limit at {RESULTS_LIMIT} and ignores "
-                f"offset/cursor/page, so this cannot be paged around: ask "
-                f"Lovable to raise the cap, add pagination, or expose a "
-                f"url-only variant."
+                f"get-known-urls: expected a 'urls' list, got "
+                f"{type(urls).__name__}. Treating that as 'no URLs' would "
+                f"re-score everything, so it is an error."
             )
-        return {r["url"] for r in rows if isinstance(r, dict) and r.get("url")}
+
+        # The route reports its own count. If it exceeds what arrived, the list
+        # was truncated somewhere, and the missing URLs are postings that would
+        # be scored and billed a second time.
+        count = body.get("count")
+        if isinstance(count, int) and count > len(urls):
+            raise EngineStoreError(
+                f"get-known-urls: reported count={count} but returned "
+                f"{len(urls)} URLs. The list is truncated, and the postings it "
+                f"omits would be scored and billed again."
+            )
+
+        return {u for u in urls if isinstance(u, str) and u}
 
     def save_results(self, user_id: str, results: list[JobResult]) -> int:
         """Upsert on (user_id, url), server-side. Returns what the route reports.
@@ -354,6 +371,11 @@ class LovableEngineStore:
     def get_results(
         self, user_id: str, verdicts: list[Verdict] | None = None
     ) -> list[JobResult]:
+        """The scored offers, whole rows. Capped at 500 by the route.
+
+        Truncation here is a display concern, not a billing one - unlike
+        known_urls, which is why that moved to its own route.
+        """
         user_id = self._guard(user_id)
         rows = self._fetch_results(user_id, verdicts=verdicts,
                                    limit=RESULTS_LIMIT)
