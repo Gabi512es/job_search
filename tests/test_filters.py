@@ -30,8 +30,10 @@ from jobscout.filters import (  # noqa: E402
     deduplicate,
     exclusion_reason,
     filter_new,
+    interleave_by_source,
     keyword_filter,
     penalty_applies,
+    published_at,
 )
 from jobscout.jobs import JobPosting, job_key, normalize_text, strip_tracking  # noqa: E402
 from jobscout.profile import load_profile  # noqa: E402
@@ -359,6 +361,105 @@ print("""  job_key changed, so the existing caches no longer match:
   would be re-scored once. Mitigation available at block 5: seed the seen_jobs
   table from the URLs already in the .xlsx files rather than from the caches.
   Flagging it now because it has a real Haiku cost.""")
+
+
+# ===========================================================================
+section("PUBLISHED_AT — the two date formats real sources actually send")
+
+from collections import Counter  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
+
+from jobscout.filters import UNKNOWN_DATE  # noqa: E402
+
+
+def dated(published: str, source: str = "s") -> JobPosting:
+    return JobPosting(title="t", company="c", url=f"https://x/{published}{source}",
+                      summary="", source=source, published=published)
+
+
+check("RFC 2822 from the RSS feeds",
+      published_at(dated("Wed, 16 Sep 2026 12:01:09 +0000")),
+      datetime(2026, 9, 16, 12, 1, 9, tzinfo=timezone.utc))
+check("bare ISO date from the LinkedIn actor",
+      published_at(dated("2026-09-06")),
+      datetime(2026, 9, 6, tzinfo=timezone.utc))
+check("ISO with a time and an offset",
+      published_at(dated("2026-09-06T08:30:00+02:00")).astimezone(timezone.utc),
+      datetime(2026, 9, 6, 6, 30, tzinfo=timezone.utc))
+check("an empty date is unknown, not an error", published_at(dated("")), UNKNOWN_DATE)
+check("and so is an unreadable one",
+      published_at(dated("last tuesday-ish")), UNKNOWN_DATE)
+check("every result is timezone-aware, so they can be compared",
+      all(published_at(dated(v)).tzinfo is not None
+          for v in ("2026-09-06", "", "junk", "Wed, 16 Sep 2026 12:01:09 +0000")), True)
+
+
+section("INTERLEAVE_BY_SOURCE — a cap can no longer starve a source")
+
+# The shape measured on a real run: one huge source, one paid source, one small
+# source, one nearly empty. Sources are named so that alphabetical order is NOT
+# the order they are passed in, which is the property being tested.
+def batch(source: str, n: int, start_day: int = 1) -> list[JobPosting]:
+    return [dated(f"2026-09-{start_day + i:02d}", source) for i in range(n)]
+
+
+mixed = batch("zz_rss", 10) + batch("linkedin", 8) + batch("aa_feed", 2)
+ordered = interleave_by_source(mixed)
+
+check("nothing is lost", len(ordered), len(mixed))
+check("and nothing is invented", {j.url for j in ordered}, {j.url for j in mixed})
+check("the first three positions hold all three sources",
+      sorted(j.source for j in ordered[:3]), ["aa_feed", "linkedin", "zz_rss"])
+check("a cap of 3 therefore scores one of each",
+      sorted(j.source for j in ordered[:3]), ["aa_feed", "linkedin", "zz_rss"])
+check("the exhausted source stops being drawn from",
+      [j.source for j in ordered].count("aa_feed"), 2)
+check("and its slots go to the others, nothing is wasted",
+      len(ordered), 20)
+
+# The bug this replaces: postings arrived grouped, so a prefix took one source.
+grouped = batch("zz_rss", 10) + batch("linkedin", 8)
+check("BEFORE: a prefix of 8 was one source only",
+      len({j.source for j in grouped[:8]}), 1)
+check("AFTER: a prefix of 8 is balanced",
+      sorted(Counter(j.source for j in interleave_by_source(grouped)[:8]).values()),
+      [4, 4])
+
+# Independence from the order the connectors ran in.
+forward = interleave_by_source(batch("aa_feed", 5) + batch("linkedin", 5))
+backward = interleave_by_source(batch("linkedin", 5) + batch("aa_feed", 5))
+check("the result does not depend on connector call order",
+      [j.url for j in forward], [j.url for j in backward])
+
+# Recency within a source.
+recency = interleave_by_source([
+    dated("2026-09-01", "s"), dated("2026-09-30", "s"), dated("2026-09-15", "s"),
+])
+check("within a source, newest first",
+      [j.published for j in recency], ["2026-09-30", "2026-09-15", "2026-09-01"])
+
+undated = interleave_by_source([
+    dated("", "s"), dated("2026-09-30", "s"), dated("junk", "s"),
+])
+check("undated postings sort last within their source, never dropped",
+      [j.published for j in undated][0], "2026-09-30")
+check("and they are all still there", len(undated), 3)
+
+# Recency is NOT applied across sources: the weworkremotely trap.
+old_source = batch("aa_old", 3, start_day=1)      # 2026-09-01..03
+new_source = batch("zz_new", 3, start_day=20)     # 2026-09-20..22
+across = interleave_by_source(old_source + new_source)
+check("an older source is not buried behind a newer one",
+      sorted(j.source for j in across[:2]), ["aa_old", "zz_new"])
+
+# Edge cases.
+check("an empty list stays empty", interleave_by_source([]), [])
+check("a single source is returned newest-first, unchanged in membership",
+      len(interleave_by_source(batch("only", 4))), 4)
+check("stable for postings sharing a date, which LinkedIn's mostly do",
+      [j.url for j in interleave_by_source(
+          [dated("2026-09-06", "s"), dated("2026-09-06", "t")])],
+      [dated("2026-09-06", "s").url, dated("2026-09-06", "t").url])
 
 
 # ===========================================================================

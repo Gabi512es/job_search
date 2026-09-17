@@ -31,6 +31,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from jobscout.collect import collect
+from jobscout.filters import interleave_by_source
 from jobscout.connectors import Secrets
 from jobscout.jobs import JobPosting
 from jobscout.profile import UserProfile, Verdict
@@ -162,9 +163,16 @@ def run(
     jobs = [j for j in jobs if j.url not in known]
     counts["already_scored"] = before - len(jobs)
 
+    # Ordered before the cap, and unconditionally rather than only when a cap
+    # is set: the cap below is a plain prefix, so without this the order the
+    # connectors happened to run in decides which sources get scored at all.
+    # One code path is also one thing to reason about.
+    jobs = interleave_by_source(jobs)
+
     if opts.max_jobs_to_score is not None and len(jobs) > opts.max_jobs_to_score:
         _log(f"[pipeline] capping {len(jobs)} jobs at "
-             f"{opts.max_jobs_to_score} (max_jobs_to_score)")
+             f"{opts.max_jobs_to_score} (max_jobs_to_score), "
+             f"interleaved so every source is represented")
         counts["capped_out"] = len(jobs) - opts.max_jobs_to_score
         jobs = jobs[:opts.max_jobs_to_score]
 

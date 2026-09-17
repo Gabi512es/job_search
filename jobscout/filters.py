@@ -1,4 +1,4 @@
-"""Deduplication and profile-driven exclusion, applied before any scoring.
+"""Deduplication, profile-driven exclusion and ordering, before any scoring.
 
 Everything here is pure: no network, no API key, no cost. Filtering hard before
 scoring is what keeps the Haiku bill down, so these run first.
@@ -7,9 +7,16 @@ scoring is what keeps the Haiku bill down, so these run first.
 from __future__ import annotations
 
 from collections import OrderedDict
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from itertools import zip_longest
 
 from jobscout.jobs import JobPosting, normalize_text
 from jobscout.profile import ExclusionRule, KeywordPenalty
+
+# Sorts last within its source. Not a real date, and never compared across
+# sources, so the value only has to be smaller than any genuine one.
+UNKNOWN_DATE = datetime.min.replace(tzinfo=timezone.utc)
 
 
 def deduplicate(jobs: list[JobPosting]) -> tuple[list[JobPosting], int]:
@@ -127,3 +134,79 @@ def keyword_filter(
         if any(kw.lower() in j.text_for(fields) for kw in keywords)
     ]
     return kept, len(jobs) - len(kept)
+
+
+def published_at(job: JobPosting) -> datetime:
+    """The posting's publication instant in UTC, or UNKNOWN_DATE.
+
+    Two formats occur in real data, and both parse with the standard library:
+    RFC 2822 from the RSS feeds ("Wed, 16 Sep 2026 12:01:09 +0000") and a bare
+    ISO date from the LinkedIn actor ("2026-09-06"). Measured on a real run:
+    453 of 453 postings parsed. python-dateutil would also do it, but it is not
+    a declared dependency and this needs no third-party parser.
+
+    An unreadable date sorts the posting last within its own source rather than
+    raising. A date we cannot read is a reason to score something later, never
+    a reason to drop it.
+    """
+    raw = (job.published or "").strip()
+    if not raw:
+        return UNKNOWN_DATE
+    for parse in (datetime.fromisoformat, parsedate_to_datetime):
+        try:
+            value = parse(raw)
+        except (ValueError, TypeError):
+            continue
+        # LinkedIn's dates carry no timezone. Assuming UTC is safe because the
+        # result is only ever compared with other postings from the same source.
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return UNKNOWN_DATE
+
+
+def interleave_by_source(jobs: list[JobPosting]) -> list[JobPosting]:
+    """Order postings so that truncating the list cannot starve a source.
+
+    The cap in pipeline.run() is a plain prefix, jobs[:n]. Postings used to
+    arrive grouped by connector, so that prefix was decided by the order the
+    connectors happened to run in: MEASURED on a real 435-posting run, the
+    first LinkedIn posting sat at position 260, so the default cap of 25 scored
+    RSS only - after paying $1.20 to scrape LinkedIn.
+
+    So: take one posting from each source in turn, repeatedly. Every enabled
+    source is represented within the first few positions whatever the cap is,
+    and a source that runs out simply stops being drawn from, its remaining
+    slots going to the others. That is why this is an ordering and not a quota
+    per source: no redistribution pass to write, and the property holds for
+    every n rather than for one computed in advance.
+
+    Sources are taken in name order, which is what makes this independent of
+    the connector call order rather than merely a different arbitrary one.
+
+    Within a source, newest first. Recency is deliberately NOT applied across
+    sources: MEASURED on the same run, weworkremotely's postings were dated
+    18 August while jobicy's and hnrss's were 16-17 September, so a global date
+    sort would have buried weworkremotely exactly as the old code buried
+    LinkedIn. It would move the bias, not remove it.
+
+    No relevance heuristic either. Guessing which postings are worth scoring
+    from their titles would be a cruder copy of the judgement the model is
+    there to make, and this codebase already has one bug from letting the LLM
+    redo arithmetic Python owns.
+    """
+    groups: dict[str, list[JobPosting]] = {}
+    for job in jobs:
+        groups.setdefault(job.source, []).append(job)
+
+    # sorted() is stable, so postings sharing a date keep the order they
+    # arrived in. LinkedIn's dates have no time component and 194 postings
+    # shared just 8 distinct values, which makes that tie-breaking the rule
+    # rather than the exception.
+    queues = [
+        sorted(group, key=published_at, reverse=True)
+        for _, group in sorted(groups.items())
+    ]
+
+    ordered: list[JobPosting] = []
+    for row in zip_longest(*queues):
+        ordered.extend(job for job in row if job is not None)
+    return ordered
