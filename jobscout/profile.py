@@ -9,15 +9,19 @@ A profile is a document: it round-trips to and from JSON with
 shape of the `profiles.config` jsonb column described in ARCHITECTURE.md § 5.3.
 
 The CV itself is never stored in the profile JSON. `cv_path` points at a file
-outside git; later, Supabase will supply `cv_text` instead.
+outside git, for local runs. On the server there is no such file: the profile
+and the CV both arrive from Supabase through the get-profile route, and
+`profile_from_engine()` at the bottom of this module turns that into a
+UserProfile.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal, Mapping
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from cost_guard import CostPolicy
 
@@ -396,11 +400,105 @@ class UserProfile(BaseModel):
 
 def load_profile(path: str | Path, base_dir: Path | None = None) -> UserProfile:
     """Load and validate one profile JSON file."""
-    import json
-
     path = Path(path)
     profile = UserProfile.model_validate(json.loads(path.read_text(encoding="utf-8")))
     if base_dir is None:
         base_dir = path.parent.parent
     profile.load_cv(base_dir)  # fail fast if the CV is missing
     return profile
+
+
+# ---------------------------------------------------------------------------
+# Profiles that come from Supabase rather than from disk
+# ---------------------------------------------------------------------------
+
+class EngineProfileError(ValueError):
+    """What get-profile returned cannot become a UserProfile."""
+
+
+def profile_from_engine(row: Mapping[str, Any], *, user_id: str) -> UserProfile:
+    """Build a UserProfile from the row the get-profile route returns.
+
+    `row` is Lovable's profile object: its own onboarding columns, plus
+    `engine_scoring_profile` (the scoring document, same shape as a
+    profiles/*.json file) and `cv_text` (the CV Lovable already extracted).
+
+    This is the server-side counterpart of load_profile(). It touches no file,
+    which is the point: on the deployment there is no profiles/ directory and
+    no CV to read. It is a pure function of `row`, so it is tested without a
+    network call.
+
+    Nothing is ever invented. Every path out of here is either a valid profile
+    the user actually configured, or an EngineProfileError naming what is
+    missing.
+    """
+    if not isinstance(row, Mapping):
+        raise EngineProfileError(
+            f"get-profile returned {type(row).__name__}, not an object, "
+            f"for user {user_id!r}."
+        )
+
+    raw = row.get("engine_scoring_profile")
+
+    # The normal case for an account that has only been through onboarding.
+    #
+    # This raises rather than falling back to a default profile, and the reason
+    # is persistence, not output quality. A default would score postings with
+    # invented dimensions, those scores would be written to job_results, and
+    # their URLs would join known_urls. The next run - the one with the real
+    # profile - would then skip those postings as already seen. So the fallback
+    # would spend Haiku money to permanently poison the deduplication set.
+    # Failing here spends nothing and is undone by storing a profile.
+    if raw is None or raw == "" or raw == {}:
+        raise EngineProfileError(
+            f"user {user_id!r} has no engine_scoring_profile. The engine "
+            f"cannot score without dimensions, weights and thresholds, and "
+            f"inventing them would write meaningless scores into job_results "
+            f"and mark those postings as already seen, so the real profile "
+            f"would never re-score them. Store a scoring profile for this "
+            f"user first."
+        )
+
+    # A jsonb column arrives as an object, a text column as a string.
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise EngineProfileError(
+                f"user {user_id!r}: engine_scoring_profile is a string, and "
+                f"not valid JSON: {exc}"
+            ) from exc
+    if not isinstance(raw, Mapping):
+        raise EngineProfileError(
+            f"user {user_id!r}: engine_scoring_profile is "
+            f"{type(raw).__name__}, expected an object."
+        )
+
+    document = dict(raw)
+
+    # cv_path is meaningless here: it points into the repo, and the server has
+    # no such file. Dropped rather than rejected, because the route supplies
+    # the real text just below and the validator refuses to hold both.
+    document.pop("cv_path", None)
+
+    # cv_text goes to its own field, NOT to candidate_summary. They are two
+    # different parts of the prompt: candidate_summary is the one-line headline
+    # that introduces the CV (see prompts.build_eval_prompt), so overwriting it
+    # with the CV would duplicate the CV and lose the headline.
+    cv_text = row.get("cv_text")
+    if not isinstance(cv_text, str) or not cv_text.strip():
+        raise EngineProfileError(
+            f"user {user_id!r}: get-profile returned no usable cv_text "
+            f"({type(cv_text).__name__}). Scoring against an empty CV produces "
+            f"plausible-looking nonsense, so this is an error rather than a "
+            f"blank candidate section."
+        )
+    document["cv_text"] = cv_text.strip()
+
+    try:
+        return UserProfile.model_validate(document)
+    except ValidationError as exc:
+        raise EngineProfileError(
+            f"user {user_id!r}: engine_scoring_profile is not a valid "
+            f"profile. {exc}"
+        ) from exc

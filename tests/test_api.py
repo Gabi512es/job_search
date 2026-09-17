@@ -123,7 +123,11 @@ for bad in ("../secrets", "a/b", ".hidden"):
     check(f"path-like profile_id {bad!r} -> 400", r.status_code, 400)
 
 r = client.post("/estimate", json={}, headers=AUTH)
-check("missing profile_id -> 422 from validation", r.status_code, 422)
+# profile_id became optional so that lovable mode, where it means nothing, does
+# not have to send a dummy one. Locally an empty one is still refused, now by
+# the path check rather than by pydantic.
+check("missing profile_id -> 400, still refused", r.status_code, 400)
+check("and names the empty value", "invalid profile_id" in r.json()["detail"], True)
 
 
 section("ESTIMATE — real cost figures, nothing spent")
@@ -285,6 +289,211 @@ r = client.options("/results", headers={
 })
 check("an unknown origin gets no allow-origin header",
       r.headers.get("access-control-allow-origin"), None)
+
+
+# ===========================================================================
+section("PROFILE FROM SUPABASE — what the server runs on, built from get-profile")
+
+import json as _json  # noqa: E402
+
+from jobscout.profile import (  # noqa: E402
+    EngineProfileError, UserProfile, profile_from_engine,
+)
+
+# The fictional committed profile stands in for a stored scoring document, so
+# no real profile is read or printed here.
+DOCUMENT = _json.loads((REPO / "profiles" / "example.json").read_text(encoding="utf-8"))
+CV = "Fictional CV body, supplied by the route rather than read from a file."
+
+
+def engine_row(**overrides) -> dict:
+    """What get-profile returns: Lovable's columns plus the two engine ones."""
+    row = {
+        "id": "u-1",
+        "target_titles": ["AI Engineer"],
+        "engine_scoring_profile": _json.loads(_json.dumps(DOCUMENT)),
+        "cv_text": CV,
+    }
+    row.update(overrides)
+    return row
+
+
+def raises(fn) -> str:
+    """The message of the EngineProfileError fn raises, or '' if it does not."""
+    try:
+        fn()
+    except EngineProfileError as exc:
+        return str(exc)
+    return ""
+
+
+# -- the happy path ---------------------------------------------------------
+
+built = profile_from_engine(engine_row(), user_id="u-1")
+check("builds a UserProfile", isinstance(built, UserProfile), True)
+check("from the stored document, not from disk", built.profile_id, "example")
+check("dimensions come through", built.dimension_keys, ["role_fit", "location"])
+check("weights too", built.weights, {"role_fit": 0.6, "location": 0.4})
+check("thresholds too", built.thresholds.yes_above, DOCUMENT["thresholds"]["yes_above"])
+check("verdict labels too", built.verdict_labels.yes,
+      DOCUMENT["verdict_labels"]["yes"])
+check("export sheets too", [sheet.name for sheet in built.export.sheets],
+      [sheet["name"] for sheet in DOCUMENT["export"]["sheets"]])
+check("and a null writing config stays null, not invented",
+      built.writing, None)
+
+# The distinction that makes the prompt correct.
+check("cv_text from the route lands in cv_text", built.cv_text, CV)
+check("candidate_summary is NOT overwritten with the CV",
+      built.candidate_summary, DOCUMENT["candidate_summary"])
+check("the route's CV wins over any cv_text inside the document",
+      built.cv_text != DOCUMENT["cv_text"], True)
+check("load_cv returns it without touching the filesystem", built.load_cv(), CV)
+
+# -- cv_path -----------------------------------------------------------------
+
+stale = engine_row(engine_scoring_profile={**DOCUMENT, "cv_path": "profiles/cv/x.txt"})
+built_stale = profile_from_engine(stale, user_id="u-1")
+check("a cv_path left in the stored document is dropped, not fatal",
+      built_stale.cv_path, None)
+check("and the CV is still the route's", built_stale.cv_text, CV)
+
+# -- a text column instead of jsonb -----------------------------------------
+
+as_text = engine_row(engine_scoring_profile=_json.dumps(DOCUMENT))
+check("engine_scoring_profile as a JSON string is parsed",
+      profile_from_engine(as_text, user_id="u-1").profile_id, "example")
+check("a string that is not JSON raises",
+      "not valid JSON" in raises(
+          lambda: profile_from_engine(engine_row(engine_scoring_profile="{oops"),
+                                      user_id="u-1")), True)
+
+# -- the null case, which is the normal case for most accounts --------------
+
+for label, row in (
+    ("null", engine_row(engine_scoring_profile=None)),
+    ("empty object", engine_row(engine_scoring_profile={})),
+    ("absent", {k: v for k, v in engine_row().items() if k != "engine_scoring_profile"}),
+):
+    message = raises(lambda r=row: profile_from_engine(r, user_id="u-1"))
+    check(f"{label} engine_scoring_profile raises", bool(message), True)
+    check(f"  and {label} explains the billing consequence",
+          "already seen" in message, True)
+    check(f"  and {label} says what to do", "Store a scoring profile" in message, True)
+
+check("no default profile is invented: the error is the only outcome",
+      raises(lambda: profile_from_engine(engine_row(engine_scoring_profile=None),
+                                         user_id="u-1")) != "", True)
+
+# -- the CV --------------------------------------------------------------
+
+for label, value in (("missing", None), ("blank", "   "), ("not a string", 42)):
+    message = raises(lambda v=value: profile_from_engine(
+        engine_row(cv_text=v), user_id="u-1"))
+    check(f"{label} cv_text raises rather than scoring on nothing",
+          "nonsense" in message, True)
+
+# -- malformed documents ----------------------------------------------------
+
+bad_weights = {**DOCUMENT, "dimensions": [
+    {**DOCUMENT["dimensions"][0], "weight": 0.9},
+    {**DOCUMENT["dimensions"][1], "weight": 0.9},
+]}
+check("a document whose weights do not sum to 1 is refused",
+      "must sum to 1.0" in raises(lambda: profile_from_engine(
+          engine_row(engine_scoring_profile=bad_weights), user_id="u-1")), True)
+check("and the error names the user",
+      "'u-1'" in raises(lambda: profile_from_engine(
+          engine_row(engine_scoring_profile=bad_weights), user_id="u-1")), True)
+check("a list instead of an object is refused",
+      "expected an object" in raises(lambda: profile_from_engine(
+          engine_row(engine_scoring_profile=[1, 2]), user_id="u-1")), True)
+check("a row that is not an object at all is refused",
+      "not an object" in raises(lambda: profile_from_engine(None, user_id="u-1")), True)
+
+
+section("RESOLVE_PROFILE — json reads a file, lovable reads the route")
+
+
+class FakeStore:
+    """Only the one method resolve_profile uses."""
+
+    def __init__(self, row=None, error: Exception | None = None):
+        self.row, self.error, self.calls = row, error, []
+
+    def get_profile(self, user_id: str):
+        self.calls.append(user_id)
+        if self.error:
+            raise self.error
+        return self.row
+
+
+def with_lovable(store):
+    """Point api at the lovable backend and that store, restoring afterwards."""
+    previous = (api_module.STORE_BACKEND, api_module.get_store)
+    api_module.STORE_BACKEND = "lovable"
+    api_module.get_store = lambda: store
+    return previous
+
+
+def restore(previous) -> None:
+    api_module.STORE_BACKEND, api_module.get_store = previous
+
+
+# json mode is untouched: the file is still the source.
+profile, user = api_module.resolve_profile("example", None)
+check("json mode reads profiles/example.json", profile.profile_id, "example")
+check("and defaults user_id to the profile id", user, "example")
+check("an explicit user_id is kept", api_module.resolve_profile("example", "u-9")[1], "u-9")
+
+store = FakeStore(row=engine_row())
+previous = with_lovable(store)
+try:
+    profile, user = api_module.resolve_profile("ignored", "u-1")
+    check("lovable mode builds from the route", profile.profile_id, "example")
+    check("and asks the route for that user", store.calls, ["u-1"])
+    check("and returns the user_id it was given", user, "u-1")
+    check("the CV comes from the route", profile.cv_text, CV)
+
+    profile2, _ = api_module.resolve_profile("does_not_exist_anywhere", "u-1")
+    check("profile_id is ignored in lovable mode", profile2.profile_id, "example")
+
+    r = client.post("/estimate", json={"user_id": "u-1"}, headers=AUTH)
+    check("POST /estimate works with no profile_id at all", r.status_code, 200)
+    check("and prices the route's profile, rss only, at nothing",
+          r.json()["usd_total"], 0.0)
+
+    r = client.post("/estimate", json={"profile_id": "gabriel"}, headers=AUTH)
+    check("a request without user_id is refused", r.status_code, 400)
+    check("and says user_id is what is missing",
+          "user_id is required" in r.json()["detail"], True)
+    check("and that no local file is consulted",
+          "not from a local file" in r.json()["detail"], True)
+finally:
+    restore(previous)
+
+previous = with_lovable(FakeStore(row=engine_row(engine_scoring_profile=None)))
+try:
+    r = client.post("/estimate", json={"user_id": "u-1"}, headers=AUTH)
+    check("a user with no scoring profile gets 422, not a stack trace",
+          r.status_code, 422)
+    check("and the body explains why there is no fallback",
+          "already seen" in r.json()["detail"], True)
+finally:
+    restore(previous)
+
+previous = with_lovable(FakeStore(error=RuntimeError("engine unreachable")))
+try:
+    r = client.post("/estimate", json={"user_id": "u-1"}, headers=AUTH)
+    check("a failing get-profile is a 502, not a 4xx blaming the caller",
+          r.status_code, 502)
+    check("and reports what failed",
+          "engine unreachable" in r.json()["detail"], True)
+finally:
+    restore(previous)
+
+check("the backend is restored for the rest of the suite",
+      api_module.STORE_BACKEND, "json")
 
 
 # ===========================================================================

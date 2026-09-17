@@ -39,7 +39,9 @@ from pydantic import BaseModel, Field
 from jobscout.collect import plan_run
 from jobscout.connectors import Secrets
 from jobscout.pipeline import RunOptions, run as run_pipeline
-from jobscout.profile import UserProfile, load_profile
+from jobscout.profile import (
+    EngineProfileError, UserProfile, load_profile, profile_from_engine,
+)
 from jobscout.store.base import RunRecord
 from jobscout.store.json_store import JsonStore
 
@@ -111,9 +113,9 @@ def get_store():
     deploy, not for real use. Set STORE_BACKEND=lovable to persist through
     Lovable's engine routes instead; that needs ENGINE_API_KEY.
 
-    Note that the Lovable backend cannot yet serve GET /run/{id} or
-    GET /results: no read route exists for runs or job_results, so those two
-    endpoints raise until Lovable adds them.
+    The Lovable backend now serves runs and results too (get-run,
+    get-job-results, get-known-urls). save_application is the one Store method
+    with no route behind it yet, and it raises rather than dropping the write.
     """
     if STORE_BACKEND in ("supabase", "lovable"):
         from jobscout.store.supabase_store import LovableEngineStore
@@ -121,8 +123,8 @@ def get_store():
     return JsonStore(STORE_DIR)
 
 
-def get_profile(profile_id: str) -> UserProfile:
-    """Load a profile by id, with a 404 rather than a stack trace."""
+def profile_from_file(profile_id: str) -> UserProfile:
+    """Load profiles/<id>.json, with a 404 rather than a stack trace."""
     if not profile_id or "/" in profile_id or "\\" in profile_id or profile_id.startswith("."):
         raise HTTPException(status_code=400, detail=f"invalid profile_id: {profile_id!r}")
     path = PROFILES_DIR / f"{profile_id}.json"
@@ -140,15 +142,59 @@ def get_profile(profile_id: str) -> UserProfile:
         ) from exc
 
 
+def resolve_profile(profile_id: str, user_id: str | None) -> tuple[UserProfile, str]:
+    """The profile to run and the user it belongs to.
+
+    The two backends are deliberately not merged. STORE_BACKEND=json reads
+    profiles/*.json exactly as before, so local runs and the existing tests are
+    untouched. STORE_BACKEND=lovable reads the profile out of Supabase through
+    get-profile, keyed by user: the deployment has no profiles directory worth
+    reading and no CV file at all, so profile_id means nothing there.
+    """
+    if STORE_BACKEND in ("supabase", "lovable"):
+        if not user_id:
+            raise HTTPException(
+                status_code=400,
+                detail=("user_id is required when STORE_BACKEND=lovable: the "
+                        "profile is read from Supabase for that user, not from "
+                        "a local file. profile_id is ignored in this mode."),
+            )
+        try:
+            row = get_store().get_profile(user_id)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            # The route is unreachable or answered badly. That is the engine's
+            # dependency failing, not the caller's request being wrong.
+            raise HTTPException(
+                status_code=502,
+                detail=f"get-profile failed for {user_id!r}: "
+                       f"{type(exc).__name__}: {exc}",
+            ) from exc
+        try:
+            return profile_from_engine(row, user_id=user_id), user_id
+        except EngineProfileError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    profile = profile_from_file(profile_id)
+    return profile, (user_id or profile.profile_id)
+
+
 # ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
 
 class RunRequest(BaseModel):
-    profile_id: str = Field(description="Which profile to run, e.g. 'gabriel'")
+    profile_id: str = Field(
+        default="",
+        description=("Which profiles/*.json to run, e.g. 'gabriel'. Used only "
+                     "when STORE_BACKEND=json; ignored otherwise."),
+    )
     user_id: str | None = Field(
         default=None,
-        description="Row owner. Defaults to profile_id. A Supabase auth uuid later.",
+        description=("Row owner, a Supabase auth uuid. Required when "
+                     "STORE_BACKEND=lovable, since the profile is read for "
+                     "that user. Defaults to profile_id locally."),
     )
     confirmed_fingerprint: str | None = Field(
         default=None,
@@ -238,7 +284,7 @@ def estimate(request: RunRequest) -> dict:
     Apify cost only. The Haiku and Sonnet spend depends on how many postings
     survive filtering, which is not known until they are fetched.
     """
-    profile = get_profile(request.profile_id)
+    profile, _ = resolve_profile(request.profile_id, request.user_id)
     if request.reuse_dumps:
         profile = _apply_reuse_dumps(profile)
 
@@ -261,7 +307,7 @@ def start_run(request: RunRequest, background: BackgroundTasks) -> RunAccepted:
     cost confirmation finishes almost at once with NEEDS_CONFIRMATION and the
     fingerprint to send back.
     """
-    profile = get_profile(request.profile_id)
+    profile, user_id = resolve_profile(request.profile_id, request.user_id)
     if request.reuse_dumps:
         profile = _apply_reuse_dumps(profile)
 
@@ -273,7 +319,6 @@ def start_run(request: RunRequest, background: BackgroundTasks) -> RunAccepted:
         )
 
     store = get_store()
-    user_id = request.user_id or profile.profile_id
     run_id = uuid.uuid4().hex[:12]
 
     # Recorded before the work starts, so the first poll has something to read
