@@ -23,7 +23,9 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from jobscout.connectors import Secrets  # noqa: E402
-from jobscout.pipeline import RunOptions, run  # noqa: E402
+from jobscout.pipeline import (  # noqa: E402
+    AWAITING_SELECTION, RunOptions, run,
+)
 from jobscout.profile import load_profile  # noqa: E402
 from jobscout.store.base import Application  # noqa: E402
 from jobscout.store.json_store import JsonStore  # noqa: E402
@@ -363,6 +365,91 @@ check("the CV is included", "CV TEXT HERE" in c_prompt, True)
 check("camila does not fetch company context",
       camila.writing.include_company_context, False)
 check("gabriel does", gabriel.writing.include_company_context, True)
+
+
+# ===========================================================================
+section("AVAILABLE_TO_SCORE — the real pool, named before truncation")
+
+# gabriel replaying his saved LinkedIn dump: no Apify call, no Apify cost.
+# RSS is live and free, so the absolute numbers move day to day; every check
+# below is a relation between counts, never a hardcoded total.
+replay = gabriel.model_copy(update={"sources": [
+    src.model_copy(update={"reuse_dump": True})
+    if src.type in ("linkedin_apify", "infojobs_apify") else src
+    for src in gabriel.sources
+]})
+
+store = JsonStore(TMP / "pool")
+client = FakeClient(gabriel)
+report = run(replay, store, Secrets.from_env(),
+             RunOptions(max_jobs_to_score=5, dumps_dir=DUMPS),
+             user_id="pool-user", client=client, repo_dir=REPO)
+
+counts = report.counts
+pool = counts["available_to_score"]
+check("the pool is reported", pool > 0, True)
+check("and it is the number BEFORE the cap", pool > counts["to_score"], True)
+check("the cap is what to_score reflects", counts["to_score"], 5)
+check("pool = to_score + capped_out, the old implicit form",
+      counts["to_score"] + counts["capped_out"], pool)
+check("only the capped number was billed", client.scoring_calls, 5)
+
+# Without a cap the pool and to_score agree, which is the other half of the
+# contract the selector depends on.
+store2 = JsonStore(TMP / "pool_uncapped")
+client2 = FakeClient(gabriel)
+report2 = run(replay, store2, Secrets.from_env(),
+              RunOptions(max_jobs_to_score=None, dumps_dir=DUMPS,
+                         generate_text=False),
+              user_id="pool-user-2", client=client2, repo_dir=REPO)
+check("with no cap, pool == to_score",
+      report2.counts["available_to_score"], report2.counts["to_score"])
+check("and nothing was capped out", "capped_out" in report2.counts, False)
+
+
+section("AWAITING_SELECTION — collected and paid for, not yet scored")
+
+store3 = JsonStore(TMP / "await")
+client3 = FakeClient(gabriel)
+held = run(replay, store3, Secrets.from_env(),
+           RunOptions(select_after_collect=True, dumps_dir=DUMPS),
+           user_id="await-user", client=client3, repo_dir=REPO)
+
+check("the run stops at AWAITING_SELECTION", held.status, AWAITING_SELECTION)
+check("NOT a cost-guard decision: the guard said OK",
+      held.cost["decision"], CostDecision.OK.value)
+check("no scoring call was made", client3.scoring_calls, 0)
+check("no writing call either", client3.writing_calls, 0)
+check("the pool is in the report", held.counts["available_to_score"] > 0, True)
+check("and it matches an uncapped run of the same profile",
+      held.counts["available_to_score"], report2.counts["available_to_score"])
+check("the reason tells the caller what to do",
+      "Choose how many to score" in held.reason, True)
+
+record = store3.get_run("await-user", held.run_id)
+check("the state is persisted, not held in memory", record is not None, True)
+check("with the same status", record.status, AWAITING_SELECTION)
+check("and the pool readable from the store",
+      record.counts["available_to_score"], held.counts["available_to_score"])
+check("nothing was written to job_results",
+      len(store3.get_results("await-user")), 0)
+check("and nothing was marked as seen, so a resume re-collects the same set",
+      len(store3.seen_keys("await-user")), 0)
+
+# Resuming: same run_id, a chosen volume, still no Apify call.
+client4 = FakeClient(gabriel)
+resumed = run(replay, store3, Secrets.from_env(),
+              RunOptions(max_jobs_to_score=4, dumps_dir=DUMPS,
+                         generate_text=False),
+              user_id="await-user", client=client4, run_id=held.run_id,
+              repo_dir=REPO)
+check("the resumed run finishes", resumed.status, CostDecision.OK.value)
+check("under the same run_id", resumed.run_id, held.run_id)
+check("scoring exactly the chosen number", client4.scoring_calls, 4)
+check("and the Apify cost is still zero", resumed.cost["usd_total"], 0.0)
+check("results are saved this time", len(store3.get_results("await-user")) > 0, True)
+check("the run record now reflects the finished run",
+      store3.get_run("await-user", held.run_id).status, CostDecision.OK.value)
 
 
 # ===========================================================================

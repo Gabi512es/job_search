@@ -84,7 +84,8 @@ check("verdict restricted to the three internal values",
 check("scores bounded 0-10",
       BODY.count("score >= 0 AND score <= 10")
       + BODY.count("base_score >= 0 AND base_score <= 10"), 2)
-for status in ("RUNNING", "FAILED", "NEEDS_CONFIRMATION", "REJECTED_OVER_HARD_CAP"):
+for status in ("RUNNING", "FAILED", "NEEDS_CONFIRMATION", "AWAITING_SELECTION",
+               "REJECTED_OVER_HARD_CAP"):
     check(f"runs.status accepts {status}", f"'{status}'" in BODY, True)
 
 

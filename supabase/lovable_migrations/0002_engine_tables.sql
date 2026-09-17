@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS public.runs (
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   CONSTRAINT runs_status_valid CHECK (
     status IN ('', 'RUNNING', 'OK', 'NEEDS_CONFIRMATION',
-               'REJECTED_OVER_HARD_CAP', 'FAILED')
+               'AWAITING_SELECTION', 'REJECTED_OVER_HARD_CAP', 'FAILED')
   )
 );
 

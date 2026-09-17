@@ -30,7 +30,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from jobscout.collect import collect
+from jobscout.collect import CollectionResult, collect
 from jobscout.filters import interleave_by_source
 from jobscout.connectors import Secrets
 from jobscout.jobs import JobPosting
@@ -40,6 +40,12 @@ from jobscout.store.base import JobResult, RunRecord, Store, to_job_result
 from jobscout.writing import generate_text, should_generate
 
 from cost_guard import CostDecision, RunEstimate
+
+# A run that has collected and is waiting for the caller to choose how many
+# postings to score. Not a CostDecision: the cost guard has already said OK and
+# the Apify money is spent. What is still unspent is the Haiku scoring, which
+# is what the caller is choosing the size of.
+AWAITING_SELECTION = "AWAITING_SELECTION"
 
 _print_lock = threading.Lock()
 
@@ -64,6 +70,11 @@ class RunOptions(BaseModel):
     # money in Haiku calls; a typo in a keyword list should not spend it.
     max_jobs_to_score: int | None = None
 
+    # Stop after collection, before any billed scoring call, and record the
+    # real pool size so the caller can choose a volume from it. Resuming is
+    # free: the paid Apify payload is replayed from its dump.
+    select_after_collect: bool = False
+
     export_xlsx_path: str | None = None
     export_verdicts: list[Verdict] = ["YES", "MAYBE"]
 
@@ -85,6 +96,43 @@ class RunReport(BaseModel):
     @property
     def ran(self) -> bool:
         return self.status == CostDecision.OK.value
+
+
+def _awaiting_report(
+    run_id: str, profile: UserProfile, store: Store, user_id: str,
+    started: str, collection: CollectionResult, counts: dict[str, int],
+) -> RunReport:
+    """Collected, nothing scored, waiting for the caller to choose a volume.
+
+    Everything paid at this point is the Apify collection, and that money is
+    spent whatever the caller then picks: the choice only governs Haiku calls,
+    of which none has been made.
+
+    The postings themselves are deliberately NOT persisted. Resuming re-runs
+    collection with the saved Apify payload replayed from its dump, which costs
+    nothing, plus a fresh read of the free feeds. That avoids inventing a
+    storage route for pending postings, at one cost worth stating: the feeds
+    move between the two calls, so the pool can shift by a few postings. The
+    caller therefore sends an absolute number, not the percentage it showed.
+    """
+    store.save_run(RunRecord(
+        run_id=run_id, user_id=user_id, profile_id=profile.profile_id,
+        started_at=started, finished_at=datetime.now().isoformat(),
+        status=AWAITING_SELECTION,
+        cost_decision=collection.cost.decision.value,
+        cost_estimate=collection.cost.to_dict(),
+        cost_fingerprint=collection.cost.fingerprint,
+        counts=counts,
+    ))
+    _log(f"[pipeline] awaiting selection: {counts['available_to_score']} "
+         f"postings collected, none scored")
+    return RunReport(
+        run_id=run_id, profile_id=profile.profile_id,
+        status=AWAITING_SELECTION,
+        reason=(f"{counts['available_to_score']} postings collected and not "
+                f"yet scored. Choose how many to score."),
+        cost=collection.cost.to_dict(), counts=counts,
+    )
 
 
 def _held_report(
@@ -163,11 +211,27 @@ def run(
     jobs = [j for j in jobs if j.url not in known]
     counts["already_scored"] = before - len(jobs)
 
+    # The real pool: everything that survived deduplication, the profile's
+    # exclusions and both already-scored gates. This is the number a
+    # "score 25% / 50% / 100%" selector has to be built on, and it is named
+    # explicitly because counts["to_score"] below is overwritten with the
+    # post-cap number - the pool used to be recoverable only by adding
+    # to_score and capped_out back together.
+    counts["available_to_score"] = len(jobs)
+
     # Ordered before the cap, and unconditionally rather than only when a cap
     # is set: the cap below is a plain prefix, so without this the order the
     # connectors happened to run in decides which sources get scored at all.
     # One code path is also one thing to reason about.
     jobs = interleave_by_source(jobs)
+
+    # Second pause. The first one (the cost guard) stops a run before it
+    # spends; this one stops it after the collection is paid for and before
+    # the scoring is. The pool is only knowable here: deduplicating and
+    # excluding needs the postings in hand.
+    if opts.select_after_collect:
+        return _awaiting_report(run_id, profile, store, user_id, started,
+                                collection, counts)
 
     if opts.max_jobs_to_score is not None and len(jobs) > opts.max_jobs_to_score:
         _log(f"[pipeline] capping {len(jobs)} jobs at "

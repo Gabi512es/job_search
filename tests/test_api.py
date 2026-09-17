@@ -29,6 +29,8 @@ TMP.mkdir(parents=True, exist_ok=True)
 API_KEY = "test-key-not-a-real-secret"
 os.environ["JOBSCOUT_API_KEY"] = API_KEY
 os.environ["STORE_DIR"] = str(TMP / "store")
+# Kept out of the repo's own dumps/, so the test never writes there.
+os.environ["DUMPS_DIR"] = str(TMP / "dumps")
 os.environ["STORE_BACKEND"] = "json"
 os.environ["ALLOWED_ORIGINS"] = "https://example.lovable.app,https://other.app"
 
@@ -494,6 +496,127 @@ finally:
 
 check("the backend is restored for the rest of the suite",
       api_module.STORE_BACKEND, "json")
+
+
+# ===========================================================================
+section("SELECT — the second pause, as the frontend sees it")
+
+from jobscout.pipeline import AWAITING_SELECTION  # noqa: E402
+from jobscout.store.base import RunRecord as _RunRecord  # noqa: E402
+
+selection_calls: list[dict] = []
+
+
+def collecting_pipeline(profile, store, secrets, opts, **kwargs):
+    """Stops at AWAITING_SELECTION when asked, otherwise finishes."""
+    selection_calls.append({
+        "opts": opts,
+        "reuse": {src.type: getattr(src, "reuse_dump", None)
+                  for src in profile.enabled_sources()},
+        **kwargs})
+    status = AWAITING_SELECTION if opts.select_after_collect else "OK"
+    store.save_run(_RunRecord(
+        run_id=kwargs["run_id"], user_id=kwargs["user_id"],
+        profile_id=profile.profile_id, status=status,
+        counts={"available_to_score": 435, "fetched": 703}))
+
+
+api_module.run_pipeline = collecting_pipeline
+try:
+    r = client.post("/run", json={"profile_id": "gabriel", "reuse_dumps": True,
+                                  "select_after_collect": True,
+                                  "user_id": "sel-user"}, headers=AUTH)
+    run_id = r.json()["run_id"]
+    check("POST /run still answers 202", r.status_code, 202)
+    check("select_after_collect reaches the pipeline",
+          selection_calls[-1]["opts"].select_after_collect, True)
+
+    poll = client.get(f"/run/{run_id}", params={"user_id": "sel-user"}, headers=AUTH)
+    body = poll.json()
+    check("polling reports the new status", body["status"], AWAITING_SELECTION)
+    check("and carries the pool the selector needs",
+          body["counts"]["available_to_score"], 435)
+
+    # Resuming. The preflight below refuses without a saved payload, so give
+    # this user one: its contents are never read here, only its existence.
+    dump_dir = api_module.dumps_dir_for("sel-user")
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    (dump_dir / "linkedin_apify__gabriel.json").write_text("{}", encoding="utf-8")
+
+    selection_calls.clear()
+    r = client.post(f"/run/{run_id}/select",
+                    json={"user_id": "sel-user", "max_jobs_to_score": 108},
+                    headers=AUTH)
+    check("POST /select answers 202", r.status_code, 202)
+    check("with the same run_id, not a new one", r.json()["run_id"], run_id)
+    check("the chosen number becomes the cap",
+          selection_calls[-1]["opts"].max_jobs_to_score, 108)
+    check("and the resumed run does NOT pause again",
+          selection_calls[-1]["opts"].select_after_collect, False)
+    check("dumps are replayed, so Apify is not paid twice",
+          selection_calls[-1]["reuse"]["linkedin_apify"], True)
+    check("the run reuses this user's own dump directory",
+          selection_calls[-1]["opts"].dumps_dir,
+          str(api_module.dumps_dir_for("sel-user")))
+
+    # Errors the frontend has to handle.
+    r = client.post("/run/nope/select", json={"user_id": "sel-user"}, headers=AUTH)
+    check("an unknown run -> 404", r.status_code, 404)
+
+    r = client.post(f"/run/{run_id}/select",
+                    json={"user_id": "someone-else"}, headers=AUTH)
+    check("another user's run -> 404, not someone else's data", r.status_code, 404)
+
+    # TestClient runs background tasks synchronously, so the resumed run has
+    # already finished by now. Either way it is no longer awaiting a choice.
+    current = client.get(f"/run/{run_id}", params={"user_id": "sel-user"},
+                         headers=AUTH).json()["status"]
+    check("the run has left AWAITING_SELECTION", current != AWAITING_SELECTION, True)
+    r = client.post(f"/run/{run_id}/select", json={"user_id": "sel-user"},
+                    headers=AUTH)
+    check("selecting twice -> 409", r.status_code, 409)
+    check("and the message names the status it actually found",
+          current in r.json()["detail"], True)
+    check("and what it expected instead",
+          AWAITING_SELECTION in r.json()["detail"], True)
+
+    r = client.post(f"/run/{run_id}/select", json={}, headers=AUTH)
+    check("a missing user_id -> 422 from validation", r.status_code, 422)
+finally:
+    api_module.run_pipeline = real_pipeline
+
+check("/ advertises the new route",
+      "/run/{run_id}/select" in client.get("/").json()["routes"], True)
+
+
+section("DUMPS — one directory per user, checked before promising a resume")
+
+check("each user gets their own directory",
+      api_module.dumps_dir_for("u-1") != api_module.dumps_dir_for("u-2"), True)
+# A path-like id collapses to a single directory name, so it cannot climb out
+# of the dumps root. That the name itself contains dots does not matter; that
+# it stays one component does.
+escaped = api_module.dumps_dir_for("../../etc")
+check("a path-like id stays one directory deep",
+      escaped.parent.resolve(), api_module.DUMPS_DIR.resolve())
+check("and resolves inside the dumps root",
+      str(escaped.resolve()).startswith(str(api_module.DUMPS_DIR.resolve())), True)
+check("an empty id still resolves somewhere safe",
+      api_module.dumps_dir_for("").name, "anonymous")
+
+# A run waiting for selection whose saved payload is absent must refuse rather
+# than silently re-scraping: gabriel has linkedin_apify enabled, and this
+# user's dump directory does not exist.
+store = api_module.get_store()
+store.save_run(_RunRecord(run_id="no-dump", user_id="ghost-user",
+                          profile_id="gabriel", status=AWAITING_SELECTION,
+                          counts={"available_to_score": 10}))
+r = client.post("/run/no-dump/select", json={"user_id": "ghost-user"}, headers=AUTH)
+check("a missing payload -> 409, not a silent second scrape", r.status_code, 409)
+check("and the message says why",
+      "re-scrape" in r.json()["detail"], True)
+check("naming the connector whose payload is gone",
+      "linkedin_apify" in r.json()["detail"], True)
 
 
 # ===========================================================================

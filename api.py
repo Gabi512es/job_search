@@ -16,6 +16,7 @@ works after a redeploy and two instances see the same thing.
     POST /estimate          what a run would cost. Spends nothing.
     POST /run               start a run. SPENDS MONEY.
     GET  /run/{run_id}      status of a run
+    POST /run/{id}/select   resume a run held for a volume choice. SPENDS HAIKU.
     GET  /results           the scored offers (this is the deliverable)
 
 Every route except /health and / requires the X-API-Key header. This endpoint
@@ -38,7 +39,8 @@ from pydantic import BaseModel, Field
 
 from jobscout.collect import plan_run
 from jobscout.connectors import Secrets
-from jobscout.pipeline import RunOptions, run as run_pipeline
+from jobscout.connectors.base import DumpStore
+from jobscout.pipeline import AWAITING_SELECTION, RunOptions, run as run_pipeline
 from jobscout.profile import (
     EngineProfileError, UserProfile, load_profile, profile_from_engine,
 )
@@ -49,7 +51,11 @@ from cost_guard import check_run_cost
 
 REPO = Path(__file__).resolve().parent
 PROFILES_DIR = REPO / "profiles"
-DUMPS_DIR = REPO / "dumps"
+# Where raw Apify payloads are kept. Configurable because the resume flow
+# below replays them: on a host with an ephemeral filesystem this should point
+# at a mounted disk, or a run held for selection loses its payload on restart
+# and can only refuse to resume.
+DUMPS_DIR = Path(os.environ.get("DUMPS_DIR", str(REPO / "dumps")))
 
 API_KEY = os.environ.get("JOBSCOUT_API_KEY", "").strip()
 STORE_BACKEND = os.environ.get("STORE_BACKEND", "json").strip().lower()
@@ -121,6 +127,19 @@ def get_store():
         from jobscout.store.supabase_store import LovableEngineStore
         return LovableEngineStore.from_env()
     return JsonStore(STORE_DIR)
+
+
+def dumps_dir_for(user_id: str) -> Path:
+    """Where this user's raw Apify payloads live.
+
+    Per user, because the dump filename is keyed on profile_id alone and two
+    accounts can easily both store a profile called "gabriel". Sharing one
+    directory would let one user's run overwrite another's payload, and the
+    selection flow below replays that payload rather than re-paying for it -
+    so a collision would silently score the wrong person's postings.
+    """
+    safe = user_id.replace("/", "_").replace("\\", "_").lstrip(".") or "anonymous"
+    return DUMPS_DIR / safe
 
 
 def profile_from_file(profile_id: str) -> UserProfile:
@@ -214,6 +233,28 @@ class RunRequest(BaseModel):
         description=("Replay saved Apify payloads instead of calling Apify. "
                      "Costs nothing and is much faster."),
     )
+    select_after_collect: bool = Field(
+        default=False,
+        description=("Stop after collection with the real pool size and score "
+                     "nothing yet. The run reaches AWAITING_SELECTION; resume "
+                     "it with POST /run/{run_id}/select."),
+    )
+
+
+class SelectionRequest(BaseModel):
+    """How many of the collected postings to actually score."""
+
+    user_id: str = Field(description="Owner of the run")
+    max_jobs_to_score: int | None = Field(
+        default=None,
+        description=("Absolute number, not a percentage: the pool is "
+                     "recollected on resume and free feeds move, so a "
+                     "percentage would resolve to a different count than the "
+                     "one displayed. None scores the whole pool."),
+    )
+    generate_text: bool = Field(
+        default=True, description="Also write cover letters / emails (Sonnet)."
+    )
 
 
 class RunAccepted(BaseModel):
@@ -272,7 +313,8 @@ def root() -> dict:
     return {
         "service": "Job Scout engine",
         "runs_are": "asynchronous — POST /run returns a run_id, then poll GET /run/{run_id}",
-        "routes": ["/health", "/estimate", "/run", "/run/{run_id}", "/results"],
+        "routes": ["/health", "/estimate", "/run", "/run/{run_id}",
+                   "/run/{run_id}/select", "/results"],
         "auth": "X-API-Key header on every route except /health and /",
     }
 
@@ -284,11 +326,11 @@ def estimate(request: RunRequest) -> dict:
     Apify cost only. The Haiku and Sonnet spend depends on how many postings
     survive filtering, which is not known until they are fetched.
     """
-    profile, _ = resolve_profile(request.profile_id, request.user_id)
+    profile, user_id = resolve_profile(request.profile_id, request.user_id)
     if request.reuse_dumps:
         profile = _apply_reuse_dumps(profile)
 
-    plans, _ = plan_run(profile, DUMPS_DIR)
+    plans, _ = plan_run(profile, dumps_dir_for(user_id))
     result = check_run_cost(plans, profile.cost_policy,
                             confirmed_fingerprint=request.confirmed_fingerprint)
     payload = result.to_dict()
@@ -328,23 +370,89 @@ def start_run(request: RunRequest, background: BackgroundTasks) -> RunAccepted:
         started_at=datetime.now().isoformat(), status="RUNNING",
     ))
 
-    background.add_task(_execute, profile, store, secrets, request, user_id, run_id)
+    opts = RunOptions(
+        confirmed_fingerprint=request.confirmed_fingerprint,
+        max_jobs_to_score=request.max_jobs_to_score,
+        generate_text=request.generate_text,
+        select_after_collect=request.select_after_collect,
+        dumps_dir=str(dumps_dir_for(user_id)),
+    )
+    background.add_task(_execute, profile, store, secrets, opts, user_id, run_id)
     return RunAccepted(run_id=run_id, profile_id=profile.profile_id,
                        poll=f"/run/{run_id}")
 
 
-def _execute(profile, store, secrets, request: RunRequest,
+@app.post("/run/{run_id}/select", status_code=202, dependencies=[Protected])
+def select_volume(
+    run_id: str, request: SelectionRequest, background: BackgroundTasks
+) -> RunAccepted:
+    """Resume a run held at AWAITING_SELECTION, scoring the chosen number.
+
+    Spends Haiku, and only Haiku: collection is replayed from the Apify payload
+    saved by the first call, so Apify is not paid a second time. If that saved
+    payload is gone - the deployment restarted between the two calls, and its
+    filesystem is ephemeral - this refuses with 409 rather than silently
+    re-scraping and re-charging.
+    """
+    store = get_store()
+    record = store.get_run(request.user_id, run_id)
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no run {run_id!r} for {request.user_id!r}")
+    if record.status != AWAITING_SELECTION:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"run {run_id!r} is {record.status}, not "
+                    f"{AWAITING_SELECTION}. Only a run waiting for a volume "
+                    f"choice can be resumed this way."))
+
+    profile, user_id = resolve_profile(record.profile_id, request.user_id)
+    secrets = Secrets.from_env()
+    if not secrets.anthropic_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="ANTHROPIC_API_KEY is not configured on the server.")
+
+    # Replaying is what makes this free. Check the payload is actually there
+    # before promising a 202: without it the connector would fall back to a
+    # live fetch and bill the collection twice.
+    dumps_dir = dumps_dir_for(user_id)
+    profile = _apply_reuse_dumps(profile)
+    dumps = DumpStore(dumps_dir)
+    missing = [
+        s.type for s in profile.enabled_sources()
+        if s.type in ("linkedin_apify", "infojobs_apify")
+        and not dumps.path_for(s.type, profile.profile_id).exists()
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"the saved payload for {', '.join(missing)} is gone, so "
+                    f"resuming would re-scrape and charge for collection "
+                    f"again. Start a new run instead."))
+
+    store.save_run(RunRecord(
+        run_id=run_id, user_id=user_id, profile_id=profile.profile_id,
+        started_at=record.started_at or datetime.now().isoformat(),
+        status="RUNNING", counts=record.counts,
+    ))
+    opts = RunOptions(
+        max_jobs_to_score=request.max_jobs_to_score,
+        generate_text=request.generate_text,
+        dumps_dir=str(dumps_dir),
+    )
+    background.add_task(_execute, profile, store, secrets, opts, user_id, run_id)
+    return RunAccepted(run_id=run_id, profile_id=profile.profile_id,
+                       poll=f"/run/{run_id}")
+
+
+def _execute(profile, store, secrets, opts: RunOptions,
              user_id: str, run_id: str) -> None:
     """The background job. Any failure is recorded, never swallowed."""
     try:
         run_pipeline(
-            profile, store, secrets,
-            RunOptions(
-                confirmed_fingerprint=request.confirmed_fingerprint,
-                max_jobs_to_score=request.max_jobs_to_score,
-                generate_text=request.generate_text,
-                dumps_dir=str(DUMPS_DIR),
-            ),
+            profile, store, secrets, opts,
             user_id=user_id, repo_dir=REPO, run_id=run_id,
         )
     except Exception as exc:
@@ -367,8 +475,12 @@ def run_status(
     """Poll a run.
 
     status is RUNNING, then one of OK / NEEDS_CONFIRMATION /
-    REJECTED_OVER_HARD_CAP / FAILED. On NEEDS_CONFIRMATION, resend POST /run
-    with cost_fingerprint as confirmed_fingerprint.
+    AWAITING_SELECTION / REJECTED_OVER_HARD_CAP / FAILED.
+
+    On NEEDS_CONFIRMATION, resend POST /run with cost_fingerprint as
+    confirmed_fingerprint. On AWAITING_SELECTION, collection is done and paid
+    for and counts.available_to_score holds the real pool; POST
+    /run/{run_id}/select with the number to score.
     """
     record = get_store().get_run(user_id, run_id)
     if record is None:
