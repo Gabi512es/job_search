@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import os
 import threading
-from collections import deque
 import time
 import traceback
 import uuid
@@ -71,15 +70,6 @@ DUMPS_DIR = Path(os.environ.get("DUMPS_DIR", str(REPO / "dumps")))
 # PUBLIC url on purpose: a request to localhost never reaches Render's proxy,
 # which is what measures traffic, so it would not count.
 PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
-
-# When this process started. A spin-down destroys the container, so a small
-# uptime after a quiet period is the signal that the service was stopped.
-PROCESS_STARTED_AT = datetime.now().isoformat()
-_PROCESS_STARTED = time.monotonic()
-
-# The last few pings, for GET /doctor to report. A ring buffer: this must not
-# grow without bound in a long-lived process.
-KEEPALIVE_LOG: deque[dict] = deque(maxlen=50)
 KEEPALIVE_INTERVAL = float(os.environ.get("KEEPALIVE_INTERVAL_SECONDS", "600"))
 KEEPALIVE_MAX = float(os.environ.get("KEEPALIVE_MAX_SECONDS", "3600"))
 
@@ -345,8 +335,7 @@ def root() -> dict:
         "service": "Job Scout engine",
         "runs_are": "asynchronous — POST /run returns a run_id, then poll GET /run/{run_id}",
         "routes": ["/health", "/estimate", "/run", "/run/{run_id}",
-                   "/run/{run_id}/select", "/results",
-                   "/doctor (temporary)", "/doctor/keepalive (temporary)"],
+                   "/run/{run_id}/select", "/results"],
         "auth": "X-API-Key header on every route except /health and /",
     }
 
@@ -479,15 +468,20 @@ def select_volume(
                        poll=f"/run/{run_id}")
 
 
-def _keepalive(stop: threading.Event, run_id: str,
-               max_seconds: float | None = None) -> None:
+def _keepalive(stop: threading.Event, run_id: str) -> None:
     """Keep the service awake for as long as one run is executing.
 
-    Every ping is logged with the status code it got back, because whether a
-    service's request to its own public URL counts as inbound traffic is NOT
-    documented by Render. The logs are the evidence: if the pings return 200
-    and the service is still up at the end of a run nobody was polling, it
-    counts.
+    Render does not document whether a service's request to its own public URL
+    counts as the inbound traffic that prevents a spin-down. MEASURED
+    2026-09-17 on the free instance: this exact function, pinging for 25
+    minutes with nothing else touching the service, left the process alive for
+    36.7 minutes with two pings at 200 and no restart - where 15 minutes of
+    quiet would have stopped it. It counts. The ping goes to the public URL
+    for that reason; localhost never reaches the proxy that measures traffic.
+
+    Every ping is still logged with its status code, so a future change in
+    Render's behaviour shows up in the service logs rather than as runs that
+    mysteriously stop.
 
     Two bounds, both deliberate. The interval stays under the 15-minute
     threshold with room to spare. The deadline stops the pinging even if the
@@ -497,11 +491,10 @@ def _keepalive(stop: threading.Event, run_id: str,
     """
     if not PUBLIC_URL:
         return
-    limit = KEEPALIVE_MAX if max_seconds is None else max_seconds
-    deadline = time.monotonic() + limit
+    deadline = time.monotonic() + KEEPALIVE_MAX
     while not stop.wait(KEEPALIVE_INTERVAL):
         if time.monotonic() > deadline:
-            _log(f"[keepalive] {run_id}: {limit:.0f}s deadline reached, "
+            _log(f"[keepalive] {run_id}: {KEEPALIVE_MAX:.0f}s deadline reached, "
                  f"stopping. The run is still going but will no longer hold "
                  f"the service awake.")
             return
@@ -509,15 +502,9 @@ def _keepalive(stop: threading.Event, run_id: str,
             response = httpx.get(f"{PUBLIC_URL}/health", timeout=15.0)
             _log(f"[keepalive] {run_id}: GET {PUBLIC_URL}/health -> "
                  f"{response.status_code}")
-            KEEPALIVE_LOG.append({"at": datetime.now().isoformat(),
-                                  "run_id": run_id,
-                                  "status": response.status_code})
         except Exception as exc:
             _log(f"[keepalive] {run_id}: GET {PUBLIC_URL}/health failed: "
                  f"{type(exc).__name__}: {exc}")
-            KEEPALIVE_LOG.append({"at": datetime.now().isoformat(),
-                                  "run_id": run_id,
-                                  "error": f"{type(exc).__name__}: {exc}"})
 
 
 def _execute(profile, store, secrets, opts: RunOptions,
@@ -571,96 +558,6 @@ def run_status(
     if record is None:
         raise HTTPException(status_code=404, detail=f"no run {run_id!r} for {user_id!r}")
     return RunStatus(**record.model_dump())
-
-
-# ---------------------------------------------------------------------------
-# TEMPORARY — diagnostic, to be removed once the question below is settled
-#
-# Render does not document whether a service's request to its own public URL
-# counts as the inbound traffic that prevents a free instance from spinning
-# down. These two routes answer it for $0, instead of betting a $1.20 LinkedIn
-# run on the inference. They run _keepalive itself, not a copy of it, so what
-# they prove is what production does. DELETE THEM once the answer is recorded.
-# ---------------------------------------------------------------------------
-
-_doctor_stop: threading.Event | None = None
-
-
-@app.post("/doctor/keepalive", dependencies=[Protected])
-def doctor_start(
-    minutes: int = Query(default=25, ge=1, le=30,
-                         description="How long to hold the service awake."),
-) -> dict:
-    """Start the real keepalive for `minutes`, doing no other work.
-
-    Spends nothing: no Apify call, no Anthropic call, no store write. The only
-    effect is a GET to this service's own /health every KEEPALIVE_INTERVAL.
-    """
-    global _doctor_stop
-    if _doctor_stop is not None and not _doctor_stop.is_set():
-        _doctor_stop.set()          # replace a previous one rather than stack
-
-    _doctor_stop = threading.Event()
-    threading.Thread(
-        target=_keepalive, args=(_doctor_stop, "doctor"),
-        kwargs={"max_seconds": minutes * 60},
-        name="keepalive-doctor", daemon=True,
-    ).start()
-    _log(f"[doctor] keepalive started for {minutes} minutes")
-    return {
-        "started": True,
-        "minutes": minutes,
-        "interval_seconds": KEEPALIVE_INTERVAL,
-        "expected_pings": int(minutes * 60 // KEEPALIVE_INTERVAL),
-        "public_url_configured": bool(PUBLIC_URL),
-        "next_step": (f"Close every tab, wait {minutes} minutes, then "
-                      f"GET /doctor. Send nothing to this service meanwhile."),
-    }
-
-
-@app.get("/doctor", dependencies=[Protected])
-def doctor_report() -> dict:
-    """Did the service stay up? Process uptime is the evidence.
-
-    A spin-down destroys the container, so a process that has been alive
-    longer than the quiet period was never stopped. If this request itself had
-    to wake the service, the uptime it reports will be a few seconds and the
-    ping log will be empty - both fresh, because they live in the process that
-    just started.
-    """
-    uptime = time.monotonic() - _PROCESS_STARTED
-    pings = list(KEEPALIVE_LOG)
-    running = _doctor_stop is not None and not _doctor_stop.is_set()
-
-    if not PUBLIC_URL:
-        verdict = ("RENDER_EXTERNAL_URL is empty, so the keepalive is disabled "
-                   "and this proves nothing. Not running on Render?")
-    elif uptime < 120:
-        verdict = (f"This process is {uptime:.0f}s old. It was restarted, so "
-                   f"the service DID spin down: a self-ping does not count as "
-                   f"inbound traffic. Use an external pinger instead.")
-    elif pings:
-        verdict = (f"Alive for {uptime / 60:.1f} minutes with {len(pings)} "
-                   f"self-pings and no restart, so the self-ping DOES count as "
-                   f"inbound traffic - provided nothing else called this "
-                   f"service in the meantime.")
-    else:
-        verdict = (f"Alive for {uptime / 60:.1f} minutes but no ping was "
-                   f"recorded yet. Either less than one interval "
-                   f"({KEEPALIVE_INTERVAL:.0f}s) has passed, or the keepalive "
-                   f"was never started.")
-
-    return {
-        "process_started_at": PROCESS_STARTED_AT,
-        "process_uptime_seconds": round(uptime, 1),
-        "process_uptime_minutes": round(uptime / 60, 2),
-        "keepalive_running": running,
-        "public_url_configured": bool(PUBLIC_URL),
-        "interval_seconds": KEEPALIVE_INTERVAL,
-        "pings": pings,
-        "ping_count": len(pings),
-        "verdict": verdict,
-    }
 
 
 @app.get("/results", dependencies=[Protected])
