@@ -620,6 +620,124 @@ check("naming the connector whose payload is gone",
 
 
 # ===========================================================================
+section("KEEPALIVE — holding the service awake for exactly as long as a run")
+
+import threading as _threading  # noqa: E402
+import time as _time  # noqa: E402
+
+
+class FakeHttpx:
+    """Records the self-pings instead of making them."""
+
+    def __init__(self, status=200, error: Exception | None = None):
+        self.status, self.error, self.calls = status, error, []
+        self._lock = _threading.Lock()
+
+    def get(self, url, **kwargs):
+        with self._lock:
+            self.calls.append(url)
+        if self.error:
+            raise self.error
+        return type("R", (), {"status_code": self.status})()
+
+
+def run_keepalive(seconds: float, *, public_url="https://svc.onrender.com",
+                  interval=0.02, maximum=10.0, fake=None):
+    """Run _keepalive in a thread for `seconds`, then stop it. Returns the fake."""
+    fake = fake or FakeHttpx()
+    saved = (api_module.PUBLIC_URL, api_module.KEEPALIVE_INTERVAL,
+             api_module.KEEPALIVE_MAX, api_module.httpx)
+    api_module.PUBLIC_URL = public_url
+    api_module.KEEPALIVE_INTERVAL = interval
+    api_module.KEEPALIVE_MAX = maximum
+    api_module.httpx = fake
+    stop = _threading.Event()
+    thread = _threading.Thread(
+        target=api_module._keepalive, args=(stop, "run-1"), daemon=True)
+    try:
+        thread.start()
+        _time.sleep(seconds)
+        stop.set()
+        thread.join(timeout=2.0)
+        return fake, thread
+    finally:
+        (api_module.PUBLIC_URL, api_module.KEEPALIVE_INTERVAL,
+         api_module.KEEPALIVE_MAX, api_module.httpx) = saved
+
+
+# -- off by default ---------------------------------------------------------
+
+check("no RENDER_EXTERNAL_URL in this environment, so it is off",
+      api_module.PUBLIC_URL, "")
+fake, thread = run_keepalive(0.1, public_url="")
+check("with no public URL it pings nothing", fake.calls, [])
+check("and the thread exits immediately", thread.is_alive(), False)
+
+# -- pinging ----------------------------------------------------------------
+
+fake, thread = run_keepalive(0.12)
+check("it pings the PUBLIC url, not localhost",
+      all(u == "https://svc.onrender.com/health" for u in fake.calls), True)
+check("repeatedly, once per interval", len(fake.calls) >= 2, True)
+check("and stops when told to", thread.is_alive(), False)
+
+# -- the bounds -------------------------------------------------------------
+
+fake, thread = run_keepalive(0.15, maximum=0.05)
+check("the hard deadline ends it even if nobody stops it",
+      thread.is_alive(), False)
+check("after at most a couple of pings", len(fake.calls) <= 3, True)
+
+fake, thread = run_keepalive(0.12, fake=FakeHttpx(error=OSError("boom")))
+check("a failing ping does not kill the loop", len(fake.calls) >= 2, True)
+check("nor propagate out of the thread", thread.is_alive(), False)
+
+# The first ping waits one interval rather than firing at once: stopping
+# straight away must produce none at all.
+fake, thread = run_keepalive(0.0, interval=5.0)
+check("stopping before the first interval pings nothing", fake.calls, [])
+
+# -- bound to the run, by construction --------------------------------------
+
+started: list[str] = []
+stopped: list[bool] = []
+real_keepalive = api_module._keepalive
+
+
+def watched_keepalive(stop, run_id):
+    started.append(run_id)
+    stopped.append(stop.wait(2.0))
+
+
+api_module._keepalive = watched_keepalive
+api_module.run_pipeline = collecting_pipeline
+try:
+    client.post("/run", json={"profile_id": "gabriel", "reuse_dumps": True,
+                              "user_id": "ka-user"}, headers=AUTH)
+    check("a run starts one keepalive", len(started), 1)
+    check("and stops it when the run ends", stopped, [True])
+
+    # The property that matters: a pipeline that raises still stops it.
+    started.clear(); stopped.clear()
+
+    def exploding_pipeline(*a, **k):
+        raise RuntimeError("pipeline exploded")
+
+    api_module.run_pipeline = exploding_pipeline
+    client.post("/run", json={"profile_id": "gabriel", "reuse_dumps": True,
+                              "user_id": "ka-user"}, headers=AUTH)
+    check("a pipeline that raises still stops the keepalive", stopped, [True])
+    check("so a ping can never outlive the work it was protecting",
+          all(stopped), True)
+finally:
+    api_module._keepalive = real_keepalive
+    api_module.run_pipeline = real_pipeline
+
+check("the interval stays under Render's 15-minute threshold",
+      float(os.environ.get("KEEPALIVE_INTERVAL_SECONDS", "600")) < 900, True)
+
+
+# ===========================================================================
 print()
 print("=" * 78)
 if FAILURES:

@@ -27,12 +27,15 @@ spend the operator's credits.
 from __future__ import annotations
 
 import os
+import threading
+import time
 import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -56,6 +59,19 @@ PROFILES_DIR = REPO / "profiles"
 # at a mounted disk, or a run held for selection loses its payload on restart
 # and can only refuse to resume.
 DUMPS_DIR = Path(os.environ.get("DUMPS_DIR", str(REPO / "dumps")))
+
+# Render spins a free service down after 15 minutes without INBOUND traffic,
+# and a background task is not inbound traffic. A run takes 25-35 minutes, so
+# a user who closes the tab stops the frontend's polling and the service can
+# be stopped mid-run - with the Apify money already spent.
+#
+# RENDER_EXTERNAL_URL is set by Render itself and is empty everywhere else,
+# which is what disables all of this locally and in tests. The ping goes to the
+# PUBLIC url on purpose: a request to localhost never reaches Render's proxy,
+# which is what measures traffic, so it would not count.
+PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+KEEPALIVE_INTERVAL = float(os.environ.get("KEEPALIVE_INTERVAL_SECONDS", "600"))
+KEEPALIVE_MAX = float(os.environ.get("KEEPALIVE_MAX_SECONDS", "3600"))
 
 API_KEY = os.environ.get("JOBSCOUT_API_KEY", "").strip()
 STORE_BACKEND = os.environ.get("STORE_BACKEND", "json").strip().lower()
@@ -87,6 +103,11 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
+
+def _log(message: str) -> None:
+    """Stdout, unbuffered, which is what Render collects as service logs."""
+    print(message, flush=True)
+
 
 def require_api_key(x_api_key: str = Header(default="")) -> None:
     """Shared-secret check on every route that can spend money or read results.
@@ -447,9 +468,52 @@ def select_volume(
                        poll=f"/run/{run_id}")
 
 
+def _keepalive(stop: threading.Event, run_id: str) -> None:
+    """Keep the service awake for as long as one run is executing.
+
+    Every ping is logged with the status code it got back, because whether a
+    service's request to its own public URL counts as inbound traffic is NOT
+    documented by Render. The logs are the evidence: if the pings return 200
+    and the service is still up at the end of a run nobody was polling, it
+    counts.
+
+    Two bounds, both deliberate. The interval stays under the 15-minute
+    threshold with room to spare. The deadline stops the pinging even if the
+    pipeline never returns, so a hung run cannot hold the service awake
+    indefinitely - free instance hours are capped at 750 a month for the whole
+    workspace, and exhausting them suspends every free service until the next.
+    """
+    if not PUBLIC_URL:
+        return
+    deadline = time.monotonic() + KEEPALIVE_MAX
+    while not stop.wait(KEEPALIVE_INTERVAL):
+        if time.monotonic() > deadline:
+            _log(f"[keepalive] {run_id}: {KEEPALIVE_MAX:.0f}s deadline reached, "
+                 f"stopping. The run is still going but will no longer hold "
+                 f"the service awake.")
+            return
+        try:
+            response = httpx.get(f"{PUBLIC_URL}/health", timeout=15.0)
+            _log(f"[keepalive] {run_id}: GET {PUBLIC_URL}/health -> "
+                 f"{response.status_code}")
+        except Exception as exc:
+            _log(f"[keepalive] {run_id}: GET {PUBLIC_URL}/health failed: "
+                 f"{type(exc).__name__}: {exc}")
+
+
 def _execute(profile, store, secrets, opts: RunOptions,
              user_id: str, run_id: str) -> None:
-    """The background job. Any failure is recorded, never swallowed."""
+    """The background job. Any failure is recorded, never swallowed.
+
+    The keepalive is started and stopped here rather than from a registry of
+    active runs: its lifetime IS the lifetime of this call, so there is no
+    state to leak and no way for a ping to outlive the work. An exception, an
+    early return, a cost guard refusal - everything reaches the finally. If the
+    process is killed outright, the daemon thread dies with it.
+    """
+    stop = threading.Event()
+    threading.Thread(target=_keepalive, args=(stop, run_id),
+                     name=f"keepalive-{run_id}", daemon=True).start()
     try:
         run_pipeline(
             profile, store, secrets, opts,
@@ -465,6 +529,8 @@ def _execute(profile, store, secrets, opts: RunOptions,
             ))
         except Exception:
             traceback.print_exc()
+    finally:
+        stop.set()
 
 
 @app.get("/run/{run_id}", dependencies=[Protected])
