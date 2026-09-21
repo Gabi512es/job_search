@@ -6,7 +6,15 @@ httpx>=0.27.0
 # Connectors
 feedparser>=6.0.11          # RSS
 beautifulsoup4>=4.12.0      # Xarxanet
-apify-client>=1.6.0         # LinkedIn, InfoJobs
+# PINNED BELOW 3.0 ON PURPOSE. apify-client 3.0 replaced dicts with pydantic
+# models (run["defaultDatasetId"] -> run.default_dataset_id). The old range,
+# >=1.6.0, let the deployment install 3.x while development stayed on 2.x, and
+# every Apify retrieval failed there with "'Run' object is not subscriptable"
+# AFTER the actors had run and billed: $2.40 for zero postings on 2026-09-21.
+# The connectors now read both shapes, but the dataset id was only the first
+# v3 change to be hit; moving to 3.x is a deliberate migration that needs its
+# own verification, not something a redeploy should decide.
+apify-client>=2.5,<3        # LinkedIn, InfoJobs
 
 # Export (secondary output; job_results is the deliverable)
 openpyxl>=3.1.0

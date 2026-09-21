@@ -399,6 +399,160 @@ check("and reports why", again.counts["already_seen"] > 0, True)
 
 
 # ===========================================================================
+section("APIFY RESULT SHAPES — the $2.40 bug, both client versions")
+
+from jobscout.connectors.base import (  # noqa: E402
+    ApifyResultError, dataset_id, run_field,
+)
+
+
+class RunV3:
+    """What apify-client 3.x returns: a pydantic model, snake_case attributes.
+
+    Simulated rather than installed: 3.x needs Python 3.11 and this repo runs
+    3.10, which is exactly how the deployment ended up on a different version
+    from development in the first place.
+    """
+
+    default_dataset_id = "ds-v3"
+    id = "run-v3"
+
+
+V2 = {"defaultDatasetId": "ds-v2", "id": "run-v2"}
+
+check("apify-client 3.x: attribute access", dataset_id(RunV3()), "ds-v3")
+check("apify-client 2.x: the old dict still works", dataset_id(V2), "ds-v2")
+check("other fields too, on 3.x", run_field(RunV3(), "id", "id"), "run-v3")
+check("and on 2.x", run_field(V2, "id", "id"), "run-v2")
+
+
+def why(fn) -> str:
+    try:
+        fn()
+    except ApifyResultError as exc:
+        return str(exc)
+    return ""
+
+
+check("a None run raises instead of being indexed",
+      "returned None" in why(lambda: dataset_id(None)), True)
+check("and says the actor may have billed anyway",
+      "billed" in why(lambda: dataset_id(None)), True)
+check("an unrecognised shape raises rather than returning nothing",
+      "carrying no dataset id" in why(lambda: dataset_id(object())), True)
+check("naming both spellings it looked for",
+      all(k in why(lambda: dataset_id({}))
+          for k in ("default_dataset_id", "defaultDatasetId")), True)
+# The exact production failure, reproduced: the old line indexed this object.
+try:
+    RunV3()["defaultDatasetId"]
+    reproduced = ""
+except TypeError as exc:
+    reproduced = str(exc)
+check("indexing a Run object raises the error the logs showed",
+      reproduced, "'RunV3' object is not subscriptable")
+check("and dataset_id() reads the same object without raising",
+      dataset_id(RunV3()), "ds-v3")
+
+
+section("LINKEDIN — a retrieval failure is no longer silent")
+
+from jobscout.connectors.linkedin_apify import LinkedInApifyConnector  # noqa: E402
+
+
+class FakeDataset:
+    def __init__(self, items): self._items = items
+    def iterate_items(self): return iter(self._items)
+
+
+class Unreadable:
+    """A run carrying no dataset id under either spelling."""
+
+
+class FakeActor:
+    def __init__(self, client, shape): self.client, self.shape = client, shape
+
+    def call(self, run_input=None):
+        # Counted before anything can fail: starting the actor is what bills.
+        self.client.starts += 1
+        return {"v2": {"defaultDatasetId": "ds-v2", "id": "r"},
+                "v3": RunV3(),
+                "unreadable": Unreadable()}[self.shape]
+
+
+class FakeApify:
+    """Counts actor starts, because each one is money."""
+
+    def __init__(self, shape="v2", items=None):
+        self.shape, self.items, self.starts = shape, items or [], 0
+
+    def actor(self, _): return FakeActor(self, self.shape)
+
+    def dataset(self, ds_id):
+        if ds_id not in ("ds-v2", "ds-v3"):
+            raise AssertionError(f"unexpected dataset {ds_id!r}")
+        return FakeDataset(self.items)
+
+
+# Dumps go to the scratchpad, never to the repo's own dumps/.
+APIFY_TMP = Path("/private/tmp/claude-501"
+                 "/-Users-gabrielernoult-Desktop-GIT-Repos-Job-Search"
+                 "/a697afae-6c9e-4187-870d-45749f73a1a8/scratchpad/apify_shapes")
+
+
+def run_linkedin(shape: str, items=None, tmp=None):
+    """Drive _fetch_live with a fake client. No network, no spend."""
+    connector = LinkedInApifyConnector("t", DumpStore(tmp or APIFY_TMP))
+    fake = FakeApify(shape=shape, items=items)
+
+    class FakeModule:
+        ApifyClient = staticmethod(lambda token: fake)
+
+    saved = sys.modules.get("apify_client")
+    sys.modules["apify_client"] = FakeModule
+    try:
+        cfg = gabriel.source("linkedin_apify")
+        return connector._fetch_live(cfg, Secrets(apify_token="fake")), fake
+    finally:
+        if saved is not None:
+            sys.modules["apify_client"] = saved
+        else:
+            del sys.modules["apify_client"]
+
+
+items = [{"jobUrl": f"https://www.linkedin.com/jobs/view/{i}", "title": f"Job {i}",
+          "companyName": "ACME", "location": "Barcelona",
+          "description": "x", "postedAt": "2026-09-20"} for i in range(5)]
+
+jobs, fake = run_linkedin("v2", items=items)
+check("apify-client 2.x: postings still come through", len(jobs), 5)
+check("one actor start per search URL", fake.starts, 12)
+
+# THE REGRESSION TEST. This exact shape returned zero postings on 2026-09-21
+# after twelve actors had run and billed $2.40.
+jobs, fake = run_linkedin("v3", items=items)
+check("apify-client 3.x: a Run object now yields postings, not silence",
+      len(jobs), 5)
+check("the actors were still started exactly twelve times", fake.starts, 12)
+
+raised = ""
+try:
+    run_linkedin("unreadable", items=items)
+except ApifyResultError as exc:
+    raised = str(exc)
+check("a genuinely unreadable run RAISES", bool(raised), True)
+check("instead of returning [] as if nothing had been found",
+      "could not be read" in raised, True)
+check("it says how many searches were billed", "12 of 12" in raised, True)
+check("and where the data still is", "Apify console" in raised, True)
+
+# The distinction the old code destroyed.
+empty, _ = run_linkedin("v2", items=[])
+check("an actor that genuinely found nothing returns [] and does NOT raise",
+      empty, [])
+
+
+# ===========================================================================
 print()
 print("=" * 78)
 if FAILURES:

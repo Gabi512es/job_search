@@ -82,20 +82,42 @@ APIFY_PRICING: dict[str, ActorPricing] = {
         # and received 432 items — exactly 48 per URL. maxItems did not cap it.
         observed_results_per_url=48,
         cap_honoured=False,
-        source="apify.com/easyapi/infojobs-job-scraper + measured run 2026-07-19",
+        # NOT RE-VERIFIED against billing. This actor has never run on the
+        # current Apify account - its 22-run history holds only the LinkedIn
+        # actor - so these figures are still the ones read off the actor's
+        # page, and the page turned out to be wrong by 2x for LinkedIn.
+        # Treat the InfoJobs estimate as unconfirmed until one real run can be
+        # compared with its invoice.
+        source=("apify.com/easyapi/infojobs-job-scraper + measured run "
+                "2026-07-19. Page pricing, NOT confirmed against billing."),
     ),
     "curious_coder/linkedin-jobs-scraper": ActorPricing(
         actor_id="curious_coder/linkedin-jobs-scraper",
-        usd_per_start=0.0,  # no per-start fee published for this actor
-        usd_per_result=0.001,  # page states "from $1.00 / 1,000 results"
-        # MEASURED 2026-09-12 on a real 12-URL run: every one of the 12 search
-        # URLs returned exactly 100 results for count=100. This actor honours
-        # its cap, unlike easyapi/infojobs-job-scraper.
+        # BILLED, not published. Every one of the 22 runs on this account
+        # between 2026-09-12 and 2026-09-21 cost exactly $0.20005, and every
+        # one returned exactly 100 items. The published "from $1.00 / 1,000
+        # results" would have made that $0.10; the real figure is double.
+        # Reading the page instead of the invoice under-estimated a 12-URL run
+        # at $1.20 when it actually cost $2.40.
+        #
+        # It is charged per START here rather than per result, because the two
+        # cannot be told apart from this evidence: every observed run hit the
+        # 100-item cap, so $0.20005/run and $0.002/result fit identically. A
+        # per-start figure is the safe reading of an ambiguity in a spending
+        # guard: if the price is really per result, lowering max_per_search
+        # makes the estimate too high, which costs a confirmation prompt. The
+        # other way round it would silently under-report, which is what just
+        # happened.
+        usd_per_start=0.20005,
+        usd_per_result=0.0,
+        # MEASURED 2026-09-12 and again 2026-09-21: every search URL returned
+        # exactly 100 results for count=100. The actor honours its cap.
         observed_results_per_url=None,
         cap_honoured=True,
         source=(
-            "apify.com/curious_coder/linkedin-jobs-scraper + measured run "
-            "2026-09-12: 12 URLs x count=100 -> 1200 items, per-URL counts all 100"
+            "Apify billing, 22 runs 2026-09-12..2026-09-21: $0.20005 each, "
+            "100 items each. Per-start vs per-result indistinguishable because "
+            "every run hit the cap; priced per start as the conservative reading."
         ),
     ),
 }

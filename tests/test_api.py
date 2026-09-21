@@ -139,7 +139,9 @@ body = r.json()
 check("200", r.status_code, 200)
 check("gabriel's LinkedIn run is held for confirmation",
       body["decision"], "NEEDS_CONFIRMATION")
-check("at the measured $1.20", round(body["usd_total"], 2), 1.20)
+# $2.40, not the $1.20 the actor's page advertises: MEASURED against
+# Apify billing on 2026-09-21, twelve starts at $0.20005 each.
+check("at the billed $2.40", round(body["usd_total"], 2), 2.40)
 check("with a fingerprint to confirm with", bool(body["fingerprint"]), True)
 check("and a per-connector breakdown", len(body["per_connector"]), 1)
 check("the note explains what is not included",
@@ -519,6 +521,9 @@ def collecting_pipeline(profile, store, secrets, opts, **kwargs):
         run_id=kwargs["run_id"], user_id=kwargs["user_id"],
         profile_id=profile.profile_id, status=status,
         counts={"available_to_score": 435, "fetched": 703}))
+    # The real pipeline returns a RunReport, and _execute reads .status off it
+    # to decide whether to hold the service awake.
+    return type("Report", (), {"status": status})()
 
 
 api_module.run_pipeline = collecting_pipeline
@@ -735,6 +740,71 @@ finally:
 
 check("the interval stays under Render's 15-minute threshold",
       float(os.environ.get("KEEPALIVE_INTERVAL_SECONDS", "600")) < 900, True)
+
+
+# ===========================================================================
+section("KEEPALIVE AT THE PAUSE — the run is parked, the payload is not safe")
+
+check("a hold is bounded, like the run keepalive",
+      api_module.KEEPALIVE_AWAITING_MAX > 0, True)
+check("and the registry starts empty", api_module._selection_holds, {})
+
+holds: list[tuple] = []
+
+
+def watched(stop, run_id, max_seconds=None):
+    holds.append((run_id, max_seconds))
+    stop.wait(2.0)
+
+
+real_keepalive_2 = api_module._keepalive
+api_module._keepalive = watched
+api_module.run_pipeline = collecting_pipeline
+try:
+    # A run that finishes normally must NOT leave a hold behind.
+    r = client.post("/run", json={"profile_id": "gabriel", "reuse_dumps": True,
+                                  "user_id": "hold-user"}, headers=AUTH)
+    check("a finished run leaves no hold", api_module._selection_holds, {})
+    check("only the run's own keepalive ran", len(holds), 1)
+
+    # A run that parks at AWAITING_SELECTION must keep the service awake.
+    holds.clear()
+    r = client.post("/run", json={"profile_id": "gabriel", "reuse_dumps": True,
+                                  "select_after_collect": True,
+                                  "user_id": "hold-user"}, headers=AUTH)
+    paused_id = r.json()["run_id"]
+    check("the paused run starts a second keepalive", len(holds), 2)
+    check("the second one is labelled as awaiting a choice",
+          "awaiting selection" in holds[1][0], True)
+    check("and bounded by its own deadline",
+          holds[1][1], api_module.KEEPALIVE_AWAITING_MAX)
+    check("the hold is registered under the run", list(api_module._selection_holds),
+          [paused_id])
+
+    # Choosing a volume releases it.
+    dump_dir = api_module.dumps_dir_for("hold-user")
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    (dump_dir / "linkedin_apify__gabriel.json").write_text("{}", encoding="utf-8")
+    client.post(f"/run/{paused_id}/select",
+                json={"user_id": "hold-user", "max_jobs_to_score": 10},
+                headers=AUTH)
+    check("choosing a volume releases the hold",
+          paused_id in api_module._selection_holds, False)
+
+    # Two pauses in a row must not stack holds for the same run.
+    holds.clear()
+    api_module._hold_awake_for_selection("dup")
+    api_module._hold_awake_for_selection("dup")
+    check("a repeated hold replaces rather than stacks",
+          list(api_module._selection_holds), ["dup"])
+    api_module._release_selection_hold("dup")
+    check("and releasing clears the registry", api_module._selection_holds, {})
+    check("releasing an unknown run is harmless",
+          api_module._release_selection_hold("never-existed"), None)
+finally:
+    api_module._keepalive = real_keepalive_2
+    api_module.run_pipeline = real_pipeline
+    api_module._selection_holds.clear()
 
 
 # ===========================================================================

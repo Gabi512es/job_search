@@ -16,7 +16,7 @@ an explicit warning for that, and the estimate is a lower bound.
 
 from __future__ import annotations
 
-from jobscout.connectors.base import DumpStore, Secrets
+from jobscout.connectors.base import ApifyResultError, DumpStore, dataset_id, Secrets
 from jobscout.jobs import JobPosting, strip_tracking
 from jobscout.profile import LinkedInApifySource
 
@@ -134,6 +134,7 @@ class LinkedInApifyConnector:
         client = ApifyClient(secrets.apify_token)
         urls = self.search_urls(cfg)
         all_items: list[dict] = []
+        failures: list[str] = []
 
         # One actor start per search URL - this actor takes a single-element
         # `urls` array, so there is no batching to be had.
@@ -145,21 +146,38 @@ class LinkedInApifyConnector:
                     "count": cfg.max_per_search,
                     "scrapeCompanyDetails": False,
                 })
-                items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+                items = list(client.dataset(dataset_id(run)).iterate_items())
                 for item in items:
                     item.setdefault("_searchUrl", url)
                 all_items.extend(items)
                 print(f"  [linkedin]   -> {len(items)} items")
             except Exception as exc:
+                failures.append(f"{i}/{len(urls)}: {type(exc).__name__}: {exc}")
                 print(f"  [linkedin]   Apify error: {type(exc).__name__}: {exc}")
 
+        # Saved BEFORE anything is raised, so whatever was paid for and did
+        # arrive can still be replayed with reuse_dump instead of re-scraped.
         if all_items:
             path = self.dumps.save(
                 self.type, self.profile_id, all_items,
                 meta={"actor_id": ACTOR_ID, "search_urls": urls,
-                      "max_items_requested": cfg.max_per_search * len(urls)},
+                      "max_items_requested": cfg.max_per_search * len(urls),
+                      "failed_searches": failures},
             )
             print(f"  [linkedin] raw dump saved to {path}")
+
+        # A retrieval failure is not "LinkedIn had nothing this week". The
+        # actor started, so it billed; returning [] here made a paid outage
+        # look exactly like an empty result set, and a run once cost $2.40 and
+        # reported zero postings without anything appearing to go wrong.
+        if failures:
+            raise ApifyResultError(
+                f"{len(failures)} of {len(urls)} LinkedIn searches were "
+                f"started - and therefore billed - but their results could "
+                f"not be read. The data is in the Apify console. Failures: "
+                + " | ".join(failures[:4])
+                + (f" | ... and {len(failures) - 4} more" if len(failures) > 4 else "")
+            )
 
         jobs = map_items(all_items)
         print(f"  [linkedin] {len(all_items)} items, {len(jobs)} jobs after URL dedupe")

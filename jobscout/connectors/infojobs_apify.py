@@ -15,7 +15,9 @@ from __future__ import annotations
 
 from urllib.parse import urlencode
 
-from jobscout.connectors.base import DumpStore, Secrets
+from jobscout.connectors.base import (
+    ApifyResultError, DumpStore, Secrets, dataset_id, run_field,
+)
 from jobscout.filters import keyword_filter
 from jobscout.jobs import JobPosting, strip_tracking
 from jobscout.profile import InfoJobsApifySource
@@ -130,15 +132,22 @@ class InfoJobsApifyConnector:
 
         client = ApifyClient(secrets.apify_token)
         print(f"  [infojobs] {len(search_urls)} searches in one batched run")
+        # Not swallowed: a failed call may still have started the actor, and
+        # therefore billed. Returning [] would make that look like "InfoJobs
+        # had nothing", which is the same mistake that hid a $2.40 LinkedIn
+        # outage.
         try:
             run = client.actor(ACTOR_ID).call(
                 run_input={"searchUrls": search_urls, "maxItems": max_items}
             )
         except Exception as exc:
-            print(f"  [infojobs] Apify error: {type(exc).__name__}: {exc}")
-            return []
+            raise ApifyResultError(
+                f"the InfoJobs actor call failed: {type(exc).__name__}: {exc}. "
+                f"It may still have started and billed - check the Apify "
+                f"console before retrying."
+            ) from exc
 
-        items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+        items = list(client.dataset(dataset_id(run)).iterate_items())
         print(f"  [infojobs] {len(items)} items received (maxItems={max_items})")
         if len(items) > max_items:
             print(
@@ -153,8 +162,8 @@ class InfoJobsApifyConnector:
         path = self.dumps.save(
             self.type, self.profile_id, items,
             meta={
-                "apify_run_id": run.get("id"),
-                "dataset_id": run.get("defaultDatasetId"),
+                "apify_run_id": run_field(run, "id", "id"),
+                "dataset_id": dataset_id(run),
                 "actor_id": ACTOR_ID,
                 "search_urls": search_urls,
                 "max_items_requested": max_items,

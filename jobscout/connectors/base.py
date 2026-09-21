@@ -18,12 +18,65 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Mapping, Protocol
 
 from jobscout.jobs import JobPosting
 from jobscout.profile import SourceConfig
 
 from cost_guard import ConnectorPlan
+
+
+class ApifyResultError(RuntimeError):
+    """An Apify actor ran - and billed - but its result could not be read.
+
+    Distinct from "the actor found nothing", which is an empty list and costs
+    the same but means something completely different. Conflating the two is
+    what let a $2.40 run report zero postings as if that were a normal result.
+    """
+
+
+def dataset_id(run: object) -> str:
+    """The default dataset id of a finished actor run, whatever shape it is.
+
+    apify-client 3.0 replaced plain dicts with pydantic models using
+    snake_case attributes, so run["defaultDatasetId"] became
+    run.default_dataset_id. requirements.txt asked for >=1.6.0, so the
+    deployment installed 3.x while development stayed on 2.x, and on the
+    deployment every retrieval raised "'Run' object is not subscriptable" -
+    AFTER the actor had finished and been billed.
+
+    Both shapes are accepted here so that reading a result you have already
+    paid for never depends on which version happens to be installed. The
+    requirements pin is the other half of the fix; this is the half that
+    survives the pin being changed.
+    """
+    if run is None:
+        raise ApifyResultError(
+            "the actor call returned None instead of a run. The actor may "
+            "still have started and billed - check the Apify console before "
+            "retrying."
+        )
+    value = getattr(run, "default_dataset_id", None)
+    if value is None and isinstance(run, Mapping):
+        value = run.get("defaultDatasetId")
+    if not value:
+        raise ApifyResultError(
+            f"the actor call returned a {type(run).__name__} carrying no "
+            f"dataset id, as neither .default_dataset_id nor "
+            f"['defaultDatasetId']. The run was billed; its data is in the "
+            f"Apify console."
+        )
+    return str(value)
+
+
+def run_field(run: object, snake: str, camel: str) -> object | None:
+    """One more field off a run object, tolerant of both client versions."""
+    if run is None:
+        return None
+    value = getattr(run, snake, None)
+    if value is None and isinstance(run, Mapping):
+        value = run.get(camel)
+    return value
 
 
 def _find_env_file() -> Path | None:

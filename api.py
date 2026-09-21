@@ -73,6 +73,16 @@ PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 KEEPALIVE_INTERVAL = float(os.environ.get("KEEPALIVE_INTERVAL_SECONDS", "600"))
 KEEPALIVE_MAX = float(os.environ.get("KEEPALIVE_MAX_SECONDS", "3600"))
 
+# How long the service is held awake for a run parked at AWAITING_SELECTION,
+# waiting for someone to choose a volume. Nothing is executing then, but the
+# saved Apify payload lives on a filesystem that a spin-down destroys, so
+# sleeping here throws away collection that has already been paid for.
+KEEPALIVE_AWAITING_MAX = float(
+    os.environ.get("KEEPALIVE_AWAITING_MAX_SECONDS", "1800"))
+
+# run_id -> the event that releases its hold. Only for runs at the pause.
+_selection_holds: dict[str, threading.Event] = {}
+
 API_KEY = os.environ.get("JOBSCOUT_API_KEY", "").strip()
 STORE_BACKEND = os.environ.get("STORE_BACKEND", "json").strip().lower()
 STORE_DIR = os.environ.get("STORE_DIR", str(REPO / "store_data")).strip()
@@ -453,6 +463,9 @@ def select_volume(
                     f"resuming would re-scrape and charge for collection "
                     f"again. Start a new run instead."))
 
+    # The run's own keepalive takes over from here.
+    _release_selection_hold(run_id)
+
     store.save_run(RunRecord(
         run_id=run_id, user_id=user_id, profile_id=profile.profile_id,
         started_at=record.started_at or datetime.now().isoformat(),
@@ -468,7 +481,8 @@ def select_volume(
                        poll=f"/run/{run_id}")
 
 
-def _keepalive(stop: threading.Event, run_id: str) -> None:
+def _keepalive(stop: threading.Event, run_id: str,
+               max_seconds: float | None = None) -> None:
     """Keep the service awake for as long as one run is executing.
 
     Render does not document whether a service's request to its own public URL
@@ -491,10 +505,11 @@ def _keepalive(stop: threading.Event, run_id: str) -> None:
     """
     if not PUBLIC_URL:
         return
-    deadline = time.monotonic() + KEEPALIVE_MAX
+    limit = KEEPALIVE_MAX if max_seconds is None else max_seconds
+    deadline = time.monotonic() + limit
     while not stop.wait(KEEPALIVE_INTERVAL):
         if time.monotonic() > deadline:
-            _log(f"[keepalive] {run_id}: {KEEPALIVE_MAX:.0f}s deadline reached, "
+            _log(f"[keepalive] {run_id}: {limit:.0f}s deadline reached, "
                  f"stopping. The run is still going but will no longer hold "
                  f"the service awake.")
             return
@@ -505,6 +520,49 @@ def _keepalive(stop: threading.Event, run_id: str) -> None:
         except Exception as exc:
             _log(f"[keepalive] {run_id}: GET {PUBLIC_URL}/health failed: "
                  f"{type(exc).__name__}: {exc}")
+
+
+def _hold_awake_for_selection(run_id: str) -> None:
+    """Keep the service alive while a run waits for its volume to be chosen.
+
+    This was originally left out, on the reasoning that the screen showing the
+    selector would be polling anyway and that polling was already the
+    keepalive. MEASURED 2026-09-21: the screen never appeared, nothing polled,
+    and the service was stopped fifteen minutes after the pause - taking with
+    it a collection that had already cost $2.40.
+
+    The lesson is that the keepalive cannot depend on a frontend behaving as
+    expected. It is bounded all the same: after KEEPALIVE_AWAITING_MAX nobody
+    is coming, and the 409 on /select covers the lost payload.
+    """
+    previous = _selection_holds.pop(run_id, None)
+    if previous is not None:
+        previous.set()
+
+    release = threading.Event()
+    _selection_holds[run_id] = release
+
+    def hold() -> None:
+        try:
+            _keepalive(release, f"{run_id} (awaiting selection)",
+                       max_seconds=KEEPALIVE_AWAITING_MAX)
+        finally:
+            # Never leave an entry behind for a hold that has ended, or the
+            # registry grows for the life of the process.
+            if _selection_holds.get(run_id) is release:
+                del _selection_holds[run_id]
+
+    threading.Thread(target=hold, name=f"keepalive-awaiting-{run_id}",
+                     daemon=True).start()
+    _log(f"[keepalive] {run_id}: held awake for up to "
+         f"{KEEPALIVE_AWAITING_MAX / 60:.0f} min awaiting a volume choice")
+
+
+def _release_selection_hold(run_id: str) -> None:
+    """Stop holding: the choice arrived, or the run moved on."""
+    release = _selection_holds.pop(run_id, None)
+    if release is not None:
+        release.set()
 
 
 def _execute(profile, store, secrets, opts: RunOptions,
@@ -520,8 +578,9 @@ def _execute(profile, store, secrets, opts: RunOptions,
     stop = threading.Event()
     threading.Thread(target=_keepalive, args=(stop, run_id),
                      name=f"keepalive-{run_id}", daemon=True).start()
+    report = None
     try:
-        run_pipeline(
+        report = run_pipeline(
             profile, store, secrets, opts,
             user_id=user_id, repo_dir=REPO, run_id=run_id,
         )
@@ -537,6 +596,11 @@ def _execute(profile, store, secrets, opts: RunOptions,
             traceback.print_exc()
     finally:
         stop.set()
+
+    # The run is over, but a run parked at the pause is not finished with the
+    # service: its payload has to survive until someone picks a volume.
+    if report is not None and report.status == AWAITING_SELECTION:
+        _hold_awake_for_selection(run_id)
 
 
 @app.get("/run/{run_id}", dependencies=[Protected])
