@@ -30,6 +30,13 @@ from cost_guard import CostPolicy
 # against a French or Spanish string.
 Verdict = Literal["YES", "MAYBE", "NO"]
 
+# Budget tiers, cheapest first. Index order IS the comparison: a source runs
+# at a given profile tier when BUDGET_TIERS.index(source.min_tier) <= that
+# tier's index. "free" must never plan a paid connector - see
+# UserProfile._paid_sources_not_free_tier.
+BudgetTier = Literal["free", "standard", "max"]
+BUDGET_TIERS: tuple[BudgetTier, ...] = ("free", "standard", "max")
+
 
 # ---------------------------------------------------------------------------
 # Scoring
@@ -157,6 +164,13 @@ class TargetSalaryRule(BaseModel):
 
 class _BaseSource(BaseModel):
     enabled: bool = False
+    # The budget tier at which this ALREADY-ENABLED source starts running.
+    # Orthogonal to `enabled`: `enabled` says whether this source makes sense
+    # for this person at all (geography, sector, language); `min_tier` says,
+    # among the sources that do, which budget level unlocks it. Defaults to
+    # "free" so a source that never costs anything (rss, xarxanet) needs no
+    # explicit tagging.
+    min_tier: BudgetTier = "free"
 
     def _require(self, **fields) -> None:
         if not self.enabled:
@@ -221,6 +235,11 @@ SourceConfig = Annotated[
     RssSource | LinkedInApifySource | InfoJobsApifySource | XarxanetSource,
     Field(discriminator="type"),
 ]
+
+# Source types whose connector prices a real Apify plan (see cost_guard.py).
+# rss and xarxanet are not listed: their connectors' plan() always returns
+# [], so they can never cost anything regardless of min_tier.
+PAID_SOURCE_TYPES = frozenset({"linkedin_apify", "infojobs_apify"})
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +340,11 @@ class UserProfile(BaseModel):
     writing: WritingConfig | None = None
     export: ExportConfig
     cost_policy: CostPolicy = Field(default_factory=CostPolicy)
+    # The user's chosen spending intent, resolved against each source's
+    # min_tier by active_sources() - never baked into `enabled` directly, so
+    # a source added later only needs its own min_tier tagged, not every
+    # profile's tier re-chosen. "standard" reproduces today's behaviour.
+    budget_tier: BudgetTier = "standard"
 
     # -- validation ---------------------------------------------------------
 
@@ -353,6 +377,20 @@ class UserProfile(BaseModel):
             raise ValueError("supply cv_path or cv_text, not both")
         return self
 
+    @model_validator(mode="after")
+    def _paid_sources_not_free_tier(self) -> UserProfile:
+        offenders = [
+            s.type for s in self.sources
+            if s.enabled and s.type in PAID_SOURCE_TYPES and s.min_tier == "free"
+        ]
+        if offenders:
+            raise ValueError(
+                f"sources {offenders} are enabled and cost money via Apify, but "
+                f"min_tier is 'free'. The free tier must never plan a paid "
+                f"connector - set min_tier to 'standard' or 'max'."
+            )
+        return self
+
     # -- helpers ------------------------------------------------------------
 
     @property
@@ -371,6 +409,22 @@ class UserProfile(BaseModel):
 
     def enabled_sources(self) -> list[SourceConfig]:
         return [s for s in self.sources if s.enabled]
+
+    def active_sources(self, tier: BudgetTier | None = None) -> list[SourceConfig]:
+        """Sources that would actually be planned/fetched at a budget tier.
+
+        `enabled_sources()` filtered further by each source's `min_tier`.
+        Defaults to this profile's own `budget_tier`; pass an explicit tier to
+        preview a different one without mutating the profile (this is how
+        /estimate tells the caller whether "max" adds anything over
+        "standard" for this profile - see api.py).
+        """
+        tier = tier or self.budget_tier
+        ceiling = BUDGET_TIERS.index(tier)
+        return [
+            s for s in self.enabled_sources()
+            if BUDGET_TIERS.index(s.min_tier) <= ceiling
+        ]
 
     def source(self, source_type: str) -> SourceConfig | None:
         return next((s for s in self.sources if s.type == source_type), None)
@@ -475,6 +529,32 @@ def profile_from_engine(row: Mapping[str, Any], *, user_id: str) -> UserProfile:
         )
 
     document = dict(raw)
+
+    # Transitional: engine_scoring_profile rows written before budget_tier /
+    # min_tier existed have no min_tier key on any source. UserProfile defaults
+    # a missing min_tier to "free", which _paid_sources_not_free_tier then
+    # rejects for any enabled paid source - correctly, for a profile authored
+    # today, but these rows predate the concept entirely. There is no engine
+    # route to write engine_scoring_profile back (Lovable owns that column -
+    # ARCHITECTURE.md § 9), so the same zero-risk backfill applied to
+    # profiles/*.json is applied here at read time instead: an enabled paid
+    # source with the key truly ABSENT (not one explicitly set, even to
+    # "free") is treated as pre-dating the feature and defaults to "standard",
+    # reproducing the behaviour it already had. Once Lovable's own UI starts
+    # writing min_tier, every row carries the key explicitly and this is a
+    # no-op.
+    def _backfill(source: Any) -> Any:
+        if (
+            isinstance(source, Mapping)
+            and source.get("enabled")
+            and source.get("type") in PAID_SOURCE_TYPES
+            and "min_tier" not in source
+        ):
+            return dict(source) | {"min_tier": "standard"}
+        return source
+
+    if isinstance(document.get("sources"), list):
+        document["sources"] = [_backfill(s) for s in document["sources"]]
 
     # cv_path is meaningless here: it points into the repo, and the server has
     # no such file. Dropped rather than rejected, because the route supplies

@@ -255,6 +255,65 @@ Quatre points, tranchés et validés :
 4. **`FETCH_FULL` / `fetch_job_description`** — ce n'est pas un trait de profil
    mais une option de run. Déplacé dans `RunOptions` (section 5.1).
 
+### 2.4 Palier de budget — `budget_tier` / `min_tier`
+
+`enabled` (sur chaque source) mélangeait deux idées : l'éligibilité d'une
+source pour cette personne (géographie, secteur, langue — structurel, ne
+bouge jamais) et la volonté de payer pour elle (variable, choisie par
+l'utilisateur). Deux champs séparent proprement les deux axes :
+
+```python
+class _BaseSource(BaseModel):
+    enabled: bool = False
+    min_tier: Literal["free", "standard", "max"] = "free"
+
+class UserProfile(BaseModel):
+    ...
+    budget_tier: Literal["free", "standard", "max"] = "standard"
+```
+
+`min_tier` classe une source déjà `enabled` : à partir de quel palier elle
+tourne. Les connecteurs gratuits (`rss`, `xarxanet`) n'ont jamais besoin d'un
+`min_tier` explicite — leur `plan()` retourne toujours `[]` (rien à tarifer),
+donc le défaut `"free"` est correct pour eux dans tous les cas. Les
+connecteurs payants (`linkedin_apify`, `infojobs_apify`) doivent déclarer
+`min_tier: "standard"` ou `"max"` explicitement ; un validateur refuse un
+profil où une source payante et `enabled` resterait à `min_tier: "free"`, ce
+qui ferait tourner un connecteur Apify sur le palier censé coûter 0 $.
+
+`UserProfile.active_sources(tier=None)` résout l'intention au moment du run :
+`enabled_sources()` filtré par `min_tier <= budget_tier`. `enabled_sources()`
+garde son sens actuel (ce qui est configuré pour cette personne) ; c'est
+`active_sources()` que `collect.py` (`plan_run()` et `collect()`) et la
+vérification anti-double-facturation de `api.py` (`POST /run/{id}/select`)
+appellent pour décider ce qui tourne réellement.
+
+Le point clé pour la généralisation future : `budget_tier` est une intention
+de haut niveau, jamais recopiée dans `enabled`. Une nouvelle source ajoutée
+plus tard n'a besoin que de son propre `min_tier` par profil — aucun profil
+existant n'a à re-choisir son palier. Et parce que `min_tier` est per-source
+et per-profil, il n'y a pas besoin d'un palier supplémentaire pour Camila :
+son profil n'a qu'une seule source payante configurée (`infojobs_apify`), donc
+`active_sources("max")` égale `active_sources("standard")` pour elle
+naturellement, sans mécanisme séparé — exactement comme pour Gabriel, qui n'a
+lui aussi qu'une seule source payante (`linkedin_apify`). `POST /estimate`
+expose cette comparaison par profil (`budget_tiers.redundant_tiers`) pour que
+Lovable puisse griser un palier qui n'ajoute rien.
+
+**Constaté en conditions réelles le 2026-09-22**, avant tout déploiement :
+la ligne `engine_scoring_profile` réellement stockée dans Supabase pour
+Gabriel n'a ni `budget_tier` ni `min_tier` — elle précède la fonctionnalité.
+Le moteur n'a aucune route pour réécrire cette colonne (Lovable seul la
+possède, section 9), donc `profile_from_engine()` applique le même backfill
+à coût zéro que celui fait sur `profiles/*.json`, mais à la lecture : une
+source payante `enabled` dont la clé `min_tier` est **absente** (pas juste
+mise à `"free"` explicitement) est traitée comme antérieure à la
+fonctionnalité et reçoit `"standard"`, reproduisant le comportement qu'elle
+avait déjà. `load_profile()` (fichiers locaux, `STORE_BACKEND=json`) reste
+strict sans ce filet — ces fichiers sont écrits à la main, y oublier
+`min_tier` est une vraie erreur à signaler. Le jour où l'écran Lovable écrit
+`min_tier` explicitement à chaque sauvegarde, ce backfill devient un no-op.
+
 ---
 
 ## 3. Interface commune des connecteurs

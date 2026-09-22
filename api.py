@@ -45,7 +45,8 @@ from jobscout.connectors import Secrets
 from jobscout.connectors.base import DumpStore
 from jobscout.pipeline import AWAITING_SELECTION, RunOptions, run as run_pipeline
 from jobscout.profile import (
-    EngineProfileError, UserProfile, load_profile, profile_from_engine,
+    BUDGET_TIERS, PAID_SOURCE_TYPES, EngineProfileError, UserProfile,
+    load_profile, profile_from_engine,
 )
 from jobscout.store.base import RunRecord
 from jobscout.store.json_store import JsonStore
@@ -369,6 +370,20 @@ def estimate(request: RunRequest) -> dict:
         "Apify only. Scoring adds roughly $0.005 per posting in Haiku calls, "
         "capped by max_jobs_to_score."
     )
+
+    # Which sources each budget tier would activate for THIS profile, so a
+    # frontend can grey out a tier that would run the exact same sources as a
+    # cheaper one (e.g. "max" adding nothing over "standard" until a second
+    # paid, relevant-to-them source exists).
+    by_tier = {t: sorted(s.type for s in profile.active_sources(t)) for t in BUDGET_TIERS}
+    payload["budget_tiers"] = {
+        "current": profile.budget_tier,
+        "sources_by_tier": by_tier,
+        "redundant_tiers": [
+            t for i, t in enumerate(BUDGET_TIERS)
+            if i > 0 and by_tier[t] == by_tier[BUDGET_TIERS[i - 1]]
+        ],
+    }
     return payload
 
 
@@ -452,8 +467,8 @@ def select_volume(
     profile = _apply_reuse_dumps(profile)
     dumps = DumpStore(dumps_dir)
     missing = [
-        s.type for s in profile.enabled_sources()
-        if s.type in ("linkedin_apify", "infojobs_apify")
+        s.type for s in profile.active_sources()
+        if s.type in PAID_SOURCE_TYPES
         and not dumps.path_for(s.type, profile.profile_id).exists()
     ]
     if missing:

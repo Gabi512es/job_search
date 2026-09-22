@@ -48,10 +48,11 @@ class CollectionResult:
 def plan_run(
     profile: UserProfile, dumps_dir: Path | str = "dumps"
 ) -> tuple[list[ConnectorPlan], dict[str, SourceConnector]]:
-    """Ask every enabled source what it intends to do. No network, no spend."""
+    """Ask every source active at the profile's budget tier what it intends to
+    do. No network, no spend."""
     connectors = build_connectors(profile, dumps_dir)
     plans: list[ConnectorPlan] = []
-    for cfg in profile.enabled_sources():
+    for cfg in profile.active_sources():
         connector = connectors.get(cfg.type)
         if connector is None:
             raise ValueError(f"no connector registered for source type {cfg.type!r}")
@@ -87,7 +88,7 @@ def collect(
     # ---- green light -------------------------------------------------------
     jobs: list[JobPosting] = []
     per_source: dict[str, int] = {}
-    for cfg in profile.enabled_sources():
+    for cfg in profile.active_sources():
         fetched = connectors[cfg.type].fetch(cfg, secrets)
         per_source[cfg.type] = len(fetched)
         jobs.extend(fetched)

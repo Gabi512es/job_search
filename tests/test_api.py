@@ -167,6 +167,32 @@ r = client.post("/estimate",
 check("a confirmed estimate turns OK", r.json()["decision"], "OK")
 
 
+section("ESTIMATE — budget_tiers preview, for Lovable to grey out a tier")
+
+r = client.post("/estimate", json={"profile_id": "gabriel"}, headers=AUTH)
+tiers = r.json()["budget_tiers"]
+check("reports gabriel's current tier", tiers["current"], "standard")
+check("free tier is rss only for gabriel",
+      tiers["sources_by_tier"]["free"], ["rss"])
+check("standard tier adds linkedin for gabriel",
+      tiers["sources_by_tier"]["standard"], ["linkedin_apify", "rss"])
+check("max is identical to standard for gabriel (no 2nd paid source)",
+      tiers["sources_by_tier"]["max"], tiers["sources_by_tier"]["standard"])
+check("max is flagged redundant so Lovable can grey it out",
+      tiers["redundant_tiers"], ["max"])
+check("free is not flagged redundant (it genuinely differs from standard)",
+      "free" in tiers["redundant_tiers"], False)
+
+r = client.post("/estimate", json={"profile_id": "camila"}, headers=AUTH)
+tiers = r.json()["budget_tiers"]
+check("free tier is xarxanet only for camila",
+      tiers["sources_by_tier"]["free"], ["xarxanet"])
+check("standard tier adds infojobs for camila",
+      tiers["sources_by_tier"]["standard"], ["infojobs_apify", "xarxanet"])
+check("max is redundant for camila too - same reasoning, no 4th tier needed",
+      tiers["redundant_tiers"], ["max"])
+
+
 section("RUN — accepted asynchronously, without executing the pipeline")
 
 # The pipeline is replaced so nothing is billed. What is under test is that the
@@ -417,6 +443,54 @@ check("a list instead of an object is refused",
           engine_row(engine_scoring_profile=[1, 2]), user_id="u-1")), True)
 check("a row that is not an object at all is refused",
       "not an object" in raises(lambda: profile_from_engine(None, user_id="u-1")), True)
+
+
+# -- min_tier backfill for rows stored before budget_tier existed -----------
+#
+# Confirmed against a REAL row on 2026-09-22: Gabriel's stored
+# engine_scoring_profile has linkedin_apify enabled with no min_tier key at
+# all, because it was written before this feature existed and nothing can
+# write that column back (Lovable owns it). Without this backfill,
+# profile_from_engine would default min_tier to "free" and
+# _paid_sources_not_free_tier would then reject the profile outright -
+# breaking /estimate and /run for the one real paying-Apify user this engine
+# has, the moment this code deploys.
+
+def _linkedin_enabled(document: dict, **source_overrides) -> dict:
+    return {**document, "sources": [
+        {**s, "type": "linkedin_apify", "enabled": True,
+         "keywords": ["AI engineer"], "location": "Barcelona", **source_overrides}
+        if s["type"] == "linkedin_apify" else s
+        for s in document["sources"]
+    ]}
+
+
+legacy_doc = _linkedin_enabled(DOCUMENT)  # no min_tier key at all, like the real row
+legacy_built = profile_from_engine(engine_row(engine_scoring_profile=legacy_doc),
+                                   user_id="u-1")
+check("a legacy row with no min_tier key does not raise",
+      legacy_built.source("linkedin_apify").enabled, True)
+check("its enabled paid source is backfilled to standard, not left at free",
+      legacy_built.source("linkedin_apify").min_tier, "standard")
+check("free tier still excludes it (the backfill did not turn it fully on)",
+      sorted(s.type for s in legacy_built.active_sources("free")), ["rss"])
+check("standard tier includes it, matching pre-migration behaviour",
+      sorted(s.type for s in legacy_built.active_sources("standard")),
+      ["linkedin_apify", "rss"])
+
+explicit_free_doc = _linkedin_enabled(DOCUMENT, min_tier="free")
+check("a source explicitly (not just by omission) left at min_tier=free is "
+      "still rejected - the backfill only covers a genuinely absent key",
+      "min_tier is 'free'" in raises(lambda: profile_from_engine(
+          engine_row(engine_scoring_profile=explicit_free_doc), user_id="u-1")), True)
+
+explicit_max_doc = _linkedin_enabled(DOCUMENT, min_tier="max")
+check("an explicit min_tier is never overwritten by the backfill",
+      profile_from_engine(engine_row(engine_scoring_profile=explicit_max_doc),
+                          user_id="u-1").source("linkedin_apify").min_tier, "max")
+
+check("a disabled paid source is left alone (no min_tier invented for it)",
+      built.source("linkedin_apify").min_tier, "free")
 
 
 section("RESOLVE_PROFILE — json reads a file, lovable reads the route")

@@ -101,6 +101,19 @@ check("enabled sources", sorted(s.type for s in g.enabled_sources()),
 check("infojobs disabled", g.source("infojobs_apify").enabled, False)
 check("xarxanet disabled", g.source("xarxanet").enabled, False)
 
+# Budget tier — "standard" is the default and must reproduce today's active
+# set exactly, since that is the whole point of the zero-risk migration.
+check("gabriel's default budget tier is standard", g.budget_tier, "standard")
+check("linkedin is gated at standard", g.source("linkedin_apify").min_tier, "standard")
+check("rss stays free-tier (never costs anything)", g.source("rss").min_tier, "free")
+check("free tier drops the paid source",
+      sorted(s.type for s in g.active_sources("free")), ["rss"])
+check("standard tier matches today's enabled set",
+      sorted(s.type for s in g.active_sources("standard")), ["linkedin_apify", "rss"])
+check("max adds nothing over standard for gabriel (no 2nd paid source configured)",
+      sorted(s.type for s in g.active_sources("max")),
+      sorted(s.type for s in g.active_sources("standard")))
+
 check("verdict labels", [g.verdict_labels.yes, g.verdict_labels.maybe, g.verdict_labels.no],
       ["OUI", "OPPORTUNISTE", "NON"])
 check("target_salary_rule kept", g.target_salary_rule is not None, True)
@@ -158,6 +171,24 @@ check("enabled sources", sorted(s.type for s in c.enabled_sources()),
       ["infojobs_apify", "xarxanet"])
 check("rss disabled", c.source("rss").enabled, False)
 check("linkedin disabled", c.source("linkedin_apify").enabled, False)
+
+# Same budget-tier guarantees as Gabriel, but this is the case that matters:
+# Camila has no 2nd paid, relevant source at all, so "max" must equal
+# "standard" for her too - without a 4th tier and without ever touching
+# LinkedIn/RSS, which stay disabled regardless of tier.
+check("camila's default budget tier is standard", c.budget_tier, "standard")
+check("infojobs is gated at standard", c.source("infojobs_apify").min_tier, "standard")
+check("xarxanet stays free-tier (never costs anything)", c.source("xarxanet").min_tier, "free")
+check("free tier drops the paid source",
+      sorted(s.type for s in c.active_sources("free")), ["xarxanet"])
+check("standard tier matches today's enabled set",
+      sorted(s.type for s in c.active_sources("standard")), ["infojobs_apify", "xarxanet"])
+check("max adds nothing over standard for camila either",
+      sorted(s.type for s in c.active_sources("max")),
+      sorted(s.type for s in c.active_sources("standard")))
+check("disabled sources never activate at any tier, budget or not",
+      sorted(s.type for s in c.active_sources("max")
+             if s.type in ("rss", "linkedin_apify")), [])
 
 check("verdict labels", [c.verdict_labels.yes, c.verdict_labels.maybe, c.verdict_labels.no],
       ["SÍ", "OPORTUNISTA", "NO"])
@@ -261,11 +292,18 @@ def _bad_column(p):
     p["export"]["sheets"][0]["columns"][0]["value"] = "title"
 
 
+def _paid_source_left_at_free_tier(p):
+    for s in p["sources"]:
+        if s["type"] == "linkedin_apify":
+            s["min_tier"] = "free"
+
+
 rejects("weights that do not sum to 1.0", _break_weights)
 rejects("duplicate dimension keys", _dupe_dimension)
 rejects("maybe_above above yes_above", _bad_thresholds)
 rejects("a source enabled with no configuration", _enabled_but_empty)
 rejects("an unprefixed export column value", _bad_column)
+rejects("an enabled paid source left at min_tier=free", _paid_source_left_at_free_tier)
 
 # ===========================================================================
 print()
