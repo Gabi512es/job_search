@@ -93,31 +93,36 @@ APIFY_PRICING: dict[str, ActorPricing] = {
     ),
     "curious_coder/linkedin-jobs-scraper": ActorPricing(
         actor_id="curious_coder/linkedin-jobs-scraper",
-        # BILLED, not published. Every one of the 22 runs on this account
-        # between 2026-09-12 and 2026-09-21 cost exactly $0.20005, and every
-        # one returned exactly 100 items. The published "from $1.00 / 1,000
-        # results" would have made that $0.10; the real figure is double.
-        # Reading the page instead of the invoice under-estimated a 12-URL run
-        # at $1.20 when it actually cost $2.40.
+        # THE FREE-PLAN PRICE, from Apify's own pricing email of 2026-09-22:
+        # $2.00 per 1,000 results plus $0.00005 per actor start. That email
+        # states the change "only affects users on Apify free plan. Paying
+        # users are not affected" - so this figure is a property of the
+        # ACCOUNT's plan, not of the actor. On a paid plan it halves, and this
+        # entry becomes an over-estimate.
         #
-        # It is charged per START here rather than per result, because the two
-        # cannot be told apart from this evidence: every observed run hit the
-        # 100-item cap, so $0.20005/run and $0.002/result fit identically. A
-        # per-start figure is the safe reading of an ambiguity in a spending
-        # guard: if the price is really per result, lowering max_per_search
-        # makes the estimate too high, which costs a confirmation prompt. The
-        # other way round it would silently under-report, which is what just
-        # happened.
-        usd_per_start=0.20005,
-        usd_per_result=0.0,
+        # The published "from $1.00 / 1,000 results" was therefore never wrong,
+        # it was the paying-user price. Reading it instead of the invoice is
+        # what estimated a 12-URL run at $1.20 when it billed $2.40.
+        #
+        # CONFIRMED against billing, and the confirmation is exact: all 22 runs
+        # on this account between 2026-09-12 and 2026-09-21 cost $0.20005 for
+        # 100 items, which is 100 x $0.002 + $0.00005 to the fifth decimal.
+        # That trailing start fee exists only in the new scheme, which dates
+        # the change to BEFORE the announcement email rather than on it.
+        #
+        # Every observed run hit the 100-item cap, so billing data alone cannot
+        # separate per-start from per-result. The email supplies the split.
+        usd_per_start=0.00005,
+        usd_per_result=0.002,
         # MEASURED 2026-09-12 and again 2026-09-21: every search URL returned
         # exactly 100 results for count=100. The actor honours its cap.
         observed_results_per_url=None,
         cap_honoured=True,
         source=(
-            "Apify billing, 22 runs 2026-09-12..2026-09-21: $0.20005 each, "
-            "100 items each. Per-start vs per-result indistinguishable because "
-            "every run hit the cap; priced per start as the conservative reading."
+            "Apify pricing email 2026-09-22 (free plan: $2.00/1,000 results + "
+            "$0.00005/start), confirmed against billing: 22 runs "
+            "2026-09-12..2026-09-21 at $0.20005 for 100 items each. Free-plan "
+            "price - a paid Apify plan halves it."
         ),
     ),
 }

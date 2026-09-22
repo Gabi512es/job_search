@@ -139,9 +139,12 @@ body = r.json()
 check("200", r.status_code, 200)
 check("gabriel's LinkedIn run is held for confirmation",
       body["decision"], "NEEDS_CONFIRMATION")
-# $2.40, not the $1.20 the actor's page advertises: MEASURED against
-# Apify billing on 2026-09-21, twelve starts at $0.20005 each.
+# $2.40, not the $1.20 the actor's page advertises. The page quotes the
+# paying-user price; this account is on Apify's free plan, where the rate
+# doubled. CONFIRMED against billing: twelve starts at $0.20005 each.
 check("at the billed $2.40", round(body["usd_total"], 2), 2.40)
+check("which is 12 starts plus 1200 results, to the cent",
+      round(12 * 0.00005 + 1200 * 0.002, 4), round(body["usd_total"], 4))
 check("with a fingerprint to confirm with", bool(body["fingerprint"]), True)
 check("and a per-connector breakdown", len(body["per_connector"]), 1)
 check("the note explains what is not included",
