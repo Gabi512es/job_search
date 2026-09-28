@@ -60,6 +60,10 @@ check("an unrecognised code is passed through as-is rather than dropped",
       "xx" in build_keyword_suggestion_system("xx"), True)
 check("the system prompt demands bare JSON",
       "no code fence" in build_keyword_suggestion_system(None), True)
+check("the system prompt fixes a consistent Title Case rule",
+      "Title Case" in build_keyword_suggestion_system(None), True)
+check("the casing rule holds regardless of which language is requested",
+      "Title Case" in build_keyword_suggestion_system("es"), True)
 
 prompt = build_keyword_suggestion_prompt("Some CV body, with real content.")
 check("the CV text is embedded verbatim",

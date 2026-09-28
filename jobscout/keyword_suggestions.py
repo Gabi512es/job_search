@@ -46,6 +46,10 @@ def build_keyword_suggestion_system(language: str | None) -> str:
         "Each suggestion is a short search phrase (2-5 words) - the kind "
         "someone types into a job board's keyword field. Never a full "
         "sentence, never a qualifier list, never a company name.\n"
+        "Write every suggestion in Title Case (capitalize each significant "
+        "word), e.g. \"AI Engineer\", never \"ai engineer\" or \"AI ENGINEER\" "
+        "- consistently across all of them, matching how a real job title "
+        "is written.\n"
         "Return ONLY one valid JSON object. No markdown, no code fence, "
         "no preamble."
     )
