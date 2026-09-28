@@ -92,6 +92,7 @@ for method, path, payload in (
     ("post", "/run", {"profile_id": "gabriel"}),
     ("get", "/run/abc?user_id=gabriel", None),
     ("get", "/results?user_id=gabriel", None),
+    ("post", "/suggest-keywords", {"cv_text": "some cv"}),
 ):
     call = getattr(client, method)
     r = call(path, json=payload) if payload else call(path)
@@ -575,6 +576,97 @@ finally:
 
 check("the backend is restored for the rest of the suite",
       api_module.STORE_BACKEND, "json")
+
+
+# ===========================================================================
+section("SUGGEST-KEYWORDS — CV-only, independent of engine_scoring_profile")
+
+fake_suggest_calls: list[dict] = []
+real_suggest_keywords = api_module.suggest_keywords
+
+
+def fake_suggest_keywords(client, cv_text, *, language=None, **kwargs):
+    fake_suggest_calls.append({"cv_text": cv_text, "language": language})
+    return ["AI Engineer", "Applied AI Engineer", "LLM Engineer"]
+
+
+api_module.suggest_keywords = fake_suggest_keywords
+try:
+    # -- cv_text given directly: no store involved at all -------------------
+    fake_suggest_calls.clear()
+    r = client.post("/suggest-keywords",
+                    json={"cv_text": "Some CV body."}, headers=AUTH)
+    check("200 with cv_text given directly", r.status_code, 200)
+    check("returns the generated suggestions",
+          r.json()["suggestions"],
+          ["AI Engineer", "Applied AI Engineer", "LLM Engineer"])
+    check("the given cv_text reaches the generator",
+          fake_suggest_calls[-1]["cv_text"], "Some CV body.")
+    check("no language hint -> None, let the model infer it",
+          fake_suggest_calls[-1]["language"], None)
+
+    r = client.post("/suggest-keywords",
+                    json={"cv_text": "Some CV body.", "language": "es"},
+                    headers=AUTH)
+    check("a language hint is forwarded", r.json()["suggestions"] and True, True)
+    check("and reaches the generator", fake_suggest_calls[-1]["language"], "es")
+
+    # -- json mode, no cv_text given: no get-profile route to fall back to --
+    r = client.post("/suggest-keywords", json={"user_id": "gabriel"}, headers=AUTH)
+    check("json mode with no cv_text -> 422", r.status_code, 422)
+    check("and explains there is no get-profile route to read it from",
+          "no get-profile route" in r.json()["detail"], True)
+
+    # -- lovable mode, cv_text read from the store ---------------------------
+    store = FakeStore(row=engine_row())
+    previous = with_lovable(store)
+    try:
+        fake_suggest_calls.clear()
+        r = client.post("/suggest-keywords", json={"user_id": "u-1"}, headers=AUTH)
+        check("200 reading cv_text from get-profile", r.status_code, 200)
+        check("the route's own cv_text reaches the generator",
+              fake_suggest_calls[-1]["cv_text"], CV)
+        check("get-profile was asked for that user", store.calls, ["u-1"])
+
+        r = client.post("/suggest-keywords", json={}, headers=AUTH)
+        check("lovable mode with neither cv_text nor user_id -> 422",
+              r.status_code, 422)
+        check("naming user_id as what is missing",
+              "user_id is required" in r.json()["detail"], True)
+    finally:
+        restore(previous)
+
+    # -- lovable mode, but cv_text is blank: refuse, never generate from ----
+    # nothing (same refusal as profile_from_engine's cv_text gate elsewhere).
+    blank_store = FakeStore(row=engine_row(cv_text="   "))
+    previous = with_lovable(blank_store)
+    try:
+        r = client.post("/suggest-keywords", json={"user_id": "u-1"}, headers=AUTH)
+        check("a blank cv_text is refused, not generated from nothing",
+              r.status_code, 422)
+        check("explains why", "empty CV" in r.json()["detail"], True)
+    finally:
+        restore(previous)
+finally:
+    api_module.suggest_keywords = real_suggest_keywords
+
+# -- the generator itself failing surfaces as 502, not a 500 or empty [] ----
+fake_suggest_calls.clear()
+
+
+def failing_suggest_keywords(client, cv_text, *, language=None, **kwargs):
+    raise api_module.ResponseError("model would not cooperate")
+
+
+api_module.suggest_keywords = failing_suggest_keywords
+try:
+    r = client.post("/suggest-keywords",
+                    json={"cv_text": "Some CV body."}, headers=AUTH)
+    check("a generation failure is a 502", r.status_code, 502)
+    check("naming what went wrong",
+          "model would not cooperate" in r.json()["detail"], True)
+finally:
+    api_module.suggest_keywords = real_suggest_keywords
 
 
 # ===========================================================================

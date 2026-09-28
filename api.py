@@ -25,6 +25,11 @@ works after a redeploy and two instances see the same thing.
                             for a caller that still wants to see the real pool
                             before deciding.
     GET  /results           the scored offers (this is the deliverable)
+    POST /suggest-keywords  broad keyword/job-title suggestions from a CV.
+                            SPENDS SONNET, not Apify. Independent of
+                            engine_scoring_profile - works before one exists
+                            (onboarding) and again later to regenerate from
+                            "Mon profil". Writes nothing.
 
 Every route except /health and / requires the X-API-Key header. This endpoint
 starts paid Haiku and Apify calls, so an unauthenticated one would let anyone
@@ -50,6 +55,7 @@ from pydantic import BaseModel, Field
 from jobscout.collect import plan_run
 from jobscout.connectors import Secrets
 from jobscout.connectors.base import DumpStore
+from jobscout.keyword_suggestions import ResponseError, suggest_keywords
 from jobscout.pipeline import AWAITING_SELECTION, RunOptions, run as run_pipeline
 from jobscout.profile import (
     BUDGET_TIERS, PAID_SOURCE_TYPES, EngineProfileError, UserProfile,
@@ -320,6 +326,31 @@ class SelectionRequest(BaseModel):
     )
 
 
+class SuggestKeywordsRequest(BaseModel):
+    user_id: str | None = Field(
+        default=None,
+        description=("Row owner, a Supabase auth uuid. Required when "
+                     "STORE_BACKEND=lovable and cv_text is not given "
+                     "directly, since cv_text is then read for this user."),
+    )
+    cv_text: str | None = Field(
+        default=None,
+        description=("Overrides whatever cv_text is stored for user_id - use "
+                     "this to suggest from CV text just pasted or "
+                     "re-uploaded but not yet saved."),
+    )
+    language: str | None = Field(
+        default=None,
+        description=("Language for the suggestions themselves (\"en\", "
+                     "\"es\", \"fr\", \"ca\", or any language name). None "
+                     "lets the model infer it from the CV's own language."),
+    )
+
+
+class SuggestKeywordsResponse(BaseModel):
+    suggestions: list[str]
+
+
 class RunAccepted(BaseModel):
     run_id: str
     status: Literal["RUNNING"] = "RUNNING"
@@ -377,7 +408,7 @@ def root() -> dict:
         "service": "Job Scout engine",
         "runs_are": "asynchronous — POST /run returns a run_id, then poll GET /run/{run_id}",
         "routes": ["/health", "/estimate", "/run", "/run/{run_id}",
-                   "/run/{run_id}/select", "/results"],
+                   "/run/{run_id}/select", "/results", "/suggest-keywords"],
         "auth": "X-API-Key header on every route except /health and /",
     }
 
@@ -797,3 +828,58 @@ def results(
         "returned": min(len(rows), limit),
         "results": [r.model_dump() for r in rows[:limit]],
     }
+
+
+@app.post("/suggest-keywords", dependencies=[Protected])
+def suggest_keywords_route(request: SuggestKeywordsRequest) -> SuggestKeywordsResponse:
+    """Propose 3-5 broad keyword/job-title suggestions from a CV.
+
+    Deliberately independent of engine_scoring_profile: this must work
+    before any scoring profile exists (onboarding's "explore broadly, let
+    Claude propose" branch), and the exact same call regenerates suggestions
+    later from "Mon profil", picking up whatever cv_text is stored at that
+    moment - no versioning, no separate route. Writes nothing: the caller
+    decides what to keep, drop or add before ever saving a profile.
+
+    Billed: one Sonnet call. Not gated by cost_guard.py, which prices Apify
+    specifically - this is a single small call, not a per-posting or
+    per-search-URL cost.
+    """
+    cv_text = request.cv_text
+    if not cv_text:
+        if STORE_BACKEND not in ("supabase", "lovable"):
+            raise HTTPException(
+                status_code=422,
+                detail=("cv_text must be given directly: STORE_BACKEND=json "
+                        "has no get-profile route to read it from."))
+        if not request.user_id:
+            raise HTTPException(
+                status_code=422,
+                detail="user_id is required when cv_text is not given directly.")
+        row = get_store().get_profile(request.user_id)
+        cv_text = row.get("cv_text") if isinstance(row, dict) else None
+
+    if not isinstance(cv_text, str) or not cv_text.strip():
+        raise HTTPException(
+            status_code=422,
+            detail=(f"no usable cv_text for {request.user_id!r}. Generating "
+                    f"suggestions from an empty CV would be meaningless, so "
+                    f"this refuses rather than guessing."))
+
+    secrets = Secrets.from_env()
+    if not secrets.anthropic_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="ANTHROPIC_API_KEY is not configured on the server.")
+
+    import anthropic
+    client = anthropic.Anthropic(api_key=secrets.anthropic_api_key)
+    try:
+        suggestions = suggest_keywords(
+            client, cv_text.strip(), language=request.language)
+    except ResponseError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"could not generate keyword suggestions: {exc}") from exc
+
+    return SuggestKeywordsResponse(suggestions=suggestions)
