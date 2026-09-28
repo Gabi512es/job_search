@@ -16,7 +16,14 @@ works after a redeploy and two instances see the same thing.
     POST /estimate          what a run would cost. Spends nothing.
     POST /run               start a run. SPENDS MONEY.
     GET  /run/{run_id}      status of a run
-    POST /run/{id}/select   resume a run held for a volume choice. SPENDS HAIKU.
+    POST /run/{id}/select   resume a run explicitly parked with
+                            select_after_collect. SPENDS HAIKU. Not part of
+                            the default flow: POST /run's own
+                            scoring_percentage decides the volume up front,
+                            alongside the cost confirmation, so a run never
+                            has to wait on a choice that might not come. Kept
+                            for a caller that still wants to see the real pool
+                            before deciding.
     GET  /results           the scored offers (this is the deliverable)
 
 Every route except /health and / requires the X-API-Key header. This endpoint
@@ -83,6 +90,15 @@ KEEPALIVE_AWAITING_MAX = float(
 
 # run_id -> the event that releases its hold. Only for runs at the pause.
 _selection_holds: dict[str, threading.Event] = {}
+
+# If KEEPALIVE_AWAITING_MAX passes with nobody having chosen a volume, this
+# fraction of the collected pool is scored automatically rather than stranding
+# a collection that has already been paid for (see
+# _auto_select_on_timeout). 0.70 matches the "recommended" choice already
+# offered on Lovable's own selector, so the automatic fallback lands on the
+# same volume most people would have picked anyway.
+AUTO_SELECT_VOLUME_FRACTION = float(
+    os.environ.get("AUTO_SELECT_VOLUME_FRACTION", "0.70"))
 
 API_KEY = os.environ.get("JOBSCOUT_API_KEY", "").strip()
 STORE_BACKEND = os.environ.get("STORE_BACKEND", "json").strip().lower()
@@ -252,10 +268,25 @@ class RunRequest(BaseModel):
         description=("Set to the fingerprint from a NEEDS_CONFIRMATION response "
                      "to authorise that exact run."),
     )
+    scoring_percentage: int | None = Field(
+        default=70,
+        ge=0, le=100,
+        description=("How much of the real, post-dedup pool to score, decided "
+                     "up front alongside the collection cost confirmation - "
+                     "not after a pause that might never get answered. 70 "
+                     "(the recommended choice on Lovable's own selector) if "
+                     "not given. Applied once the real pool is known, so "
+                     "resolves to an absolute count internally: 70 against a "
+                     "434-posting pool scores round(434 * 0.70) = 304."),
+    )
     max_jobs_to_score: int | None = Field(
-        default=25,
-        description=("Hard ceiling on billed scoring calls. None removes it - "
-                     "a full run reaches ~450 postings."),
+        default=None,
+        description=("A hard ceiling on top of scoring_percentage, not a "
+                     "replacement for it - dev safety net so a typo in a "
+                     "keyword list cannot spend money on ~450 postings by "
+                     "accident. Whichever of the two caps the pool harder "
+                     "wins. None (the default) means only scoring_percentage "
+                     "applies."),
     )
     generate_text: bool = Field(
         default=True, description="Also write cover letters / emails (Sonnet)."
@@ -368,7 +399,9 @@ def estimate(request: RunRequest) -> dict:
     payload = result.to_dict()
     payload["note"] = (
         "Apify only. Scoring adds roughly $0.005 per posting in Haiku calls, "
-        "capped by max_jobs_to_score."
+        "for whatever share of the real post-dedup pool scoring_percentage "
+        "resolves to on POST /run - not knowable here, since this estimate "
+        "runs before collection and only sees the raw worst-case count."
     )
 
     # Which sources each budget tier would activate for THIS profile, so a
@@ -418,6 +451,7 @@ def start_run(request: RunRequest, background: BackgroundTasks) -> RunAccepted:
 
     opts = RunOptions(
         confirmed_fingerprint=request.confirmed_fingerprint,
+        scoring_percentage=request.scoring_percentage,
         max_jobs_to_score=request.max_jobs_to_score,
         generate_text=request.generate_text,
         select_after_collect=request.select_after_collect,
@@ -426,6 +460,90 @@ def start_run(request: RunRequest, background: BackgroundTasks) -> RunAccepted:
     background.add_task(_execute, profile, store, secrets, opts, user_id, run_id)
     return RunAccepted(run_id=run_id, profile_id=profile.profile_id,
                        poll=f"/run/{run_id}")
+
+
+class _ResumeRefused(Exception):
+    """A held run cannot be resumed. Carries the HTTP status a real caller
+    needs; the keepalive's own automatic fallback just logs it and gives up,
+    since nobody is waiting on a response."""
+
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+def _resume_held_run(
+    run_id: str, user_id: str, *, max_jobs_to_score: int | None,
+    generate_text: bool, auto: bool,
+) -> tuple[UserProfile, Secrets, RunOptions, str]:
+    """Validate a run parked at AWAITING_SELECTION and prepare it to be
+    scored. Does not itself call _execute: the two callers run it differently
+    (backgrounded after an HTTP 202, or inline on the keepalive's own thread).
+
+    Shared by POST /run/{id}/select (a real choice) and
+    _auto_select_on_timeout (nobody answered before the keepalive gave up).
+    `auto` marks the run's counts so the frontend can tell an automatic
+    default from a real choice - see the module docstring change of
+    2026-09-27.
+
+    Raises _ResumeRefused naming exactly why, in every case where resuming
+    would be wrong: the run does not exist, is not awaiting a choice, the
+    server cannot score right now, or the paid Apify payload is gone (this
+    check is what stands between a mistake and paying for the same collection
+    twice - do not weaken it to make the keepalive path more permissive).
+    """
+    store = get_store()
+    record = store.get_run(user_id, run_id)
+    if record is None:
+        raise _ResumeRefused(404, f"no run {run_id!r} for {user_id!r}")
+    if record.status != AWAITING_SELECTION:
+        raise _ResumeRefused(409, (
+            f"run {run_id!r} is {record.status}, not {AWAITING_SELECTION}. "
+            f"Only a run waiting for a volume choice can be resumed this "
+            f"way."))
+
+    profile, user_id = resolve_profile(record.profile_id, user_id)
+    secrets = Secrets.from_env()
+    if not secrets.anthropic_api_key:
+        raise _ResumeRefused(
+            503, "ANTHROPIC_API_KEY is not configured on the server.")
+
+    # Replaying is what makes this free. Check the payload is actually there
+    # before promising anything: without it the connector would fall back to
+    # a live fetch and bill the collection twice.
+    dumps_dir = dumps_dir_for(user_id)
+    profile = _apply_reuse_dumps(profile)
+    dumps = DumpStore(dumps_dir)
+    missing = [
+        s.type for s in profile.active_sources()
+        if s.type in PAID_SOURCE_TYPES
+        and not dumps.path_for(s.type, profile.profile_id).exists()
+    ]
+    if missing:
+        raise _ResumeRefused(409, (
+            f"the saved payload for {', '.join(missing)} is gone, so "
+            f"resuming would re-scrape and charge for collection again. "
+            f"Start a new run instead."))
+
+    # The run's own keepalive takes over from here.
+    _release_selection_hold(run_id)
+
+    counts = dict(record.counts)
+    if auto:
+        counts["volume_auto_selected"] = 1
+
+    store.save_run(RunRecord(
+        run_id=run_id, user_id=user_id, profile_id=profile.profile_id,
+        started_at=record.started_at or datetime.now().isoformat(),
+        status="RUNNING", counts=counts,
+    ))
+    opts = RunOptions(
+        max_jobs_to_score=max_jobs_to_score,
+        generate_text=generate_text,
+        dumps_dir=str(dumps_dir),
+    )
+    return profile, secrets, opts, user_id
 
 
 @app.post("/run/{run_id}/select", status_code=202, dependencies=[Protected])
@@ -440,64 +558,22 @@ def select_volume(
     filesystem is ephemeral - this refuses with 409 rather than silently
     re-scraping and re-charging.
     """
-    store = get_store()
-    record = store.get_run(request.user_id, run_id)
-    if record is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"no run {run_id!r} for {request.user_id!r}")
-    if record.status != AWAITING_SELECTION:
-        raise HTTPException(
-            status_code=409,
-            detail=(f"run {run_id!r} is {record.status}, not "
-                    f"{AWAITING_SELECTION}. Only a run waiting for a volume "
-                    f"choice can be resumed this way."))
+    try:
+        profile, secrets, opts, user_id = _resume_held_run(
+            run_id, request.user_id,
+            max_jobs_to_score=request.max_jobs_to_score,
+            generate_text=request.generate_text, auto=False)
+    except _ResumeRefused as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
-    profile, user_id = resolve_profile(record.profile_id, request.user_id)
-    secrets = Secrets.from_env()
-    if not secrets.anthropic_api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="ANTHROPIC_API_KEY is not configured on the server.")
-
-    # Replaying is what makes this free. Check the payload is actually there
-    # before promising a 202: without it the connector would fall back to a
-    # live fetch and bill the collection twice.
-    dumps_dir = dumps_dir_for(user_id)
-    profile = _apply_reuse_dumps(profile)
-    dumps = DumpStore(dumps_dir)
-    missing = [
-        s.type for s in profile.active_sources()
-        if s.type in PAID_SOURCE_TYPES
-        and not dumps.path_for(s.type, profile.profile_id).exists()
-    ]
-    if missing:
-        raise HTTPException(
-            status_code=409,
-            detail=(f"the saved payload for {', '.join(missing)} is gone, so "
-                    f"resuming would re-scrape and charge for collection "
-                    f"again. Start a new run instead."))
-
-    # The run's own keepalive takes over from here.
-    _release_selection_hold(run_id)
-
-    store.save_run(RunRecord(
-        run_id=run_id, user_id=user_id, profile_id=profile.profile_id,
-        started_at=record.started_at or datetime.now().isoformat(),
-        status="RUNNING", counts=record.counts,
-    ))
-    opts = RunOptions(
-        max_jobs_to_score=request.max_jobs_to_score,
-        generate_text=request.generate_text,
-        dumps_dir=str(dumps_dir),
-    )
-    background.add_task(_execute, profile, store, secrets, opts, user_id, run_id)
+    background.add_task(_execute, profile, get_store(), secrets, opts,
+                        user_id, run_id)
     return RunAccepted(run_id=run_id, profile_id=profile.profile_id,
                        poll=f"/run/{run_id}")
 
 
 def _keepalive(stop: threading.Event, run_id: str,
-               max_seconds: float | None = None) -> None:
+               max_seconds: float | None = None) -> str:
     """Keep the service awake for as long as one run is executing.
 
     Render does not document whether a service's request to its own public URL
@@ -517,9 +593,15 @@ def _keepalive(stop: threading.Event, run_id: str,
     pipeline never returns, so a hung run cannot hold the service awake
     indefinitely - free instance hours are capped at 750 a month for the whole
     workspace, and exhausting them suspends every free service until the next.
+
+    Returns why it stopped - "disabled" (no PUBLIC_URL, nothing ever ran),
+    "released" (`stop` was set before the deadline), or "deadline" (the bound
+    was reached first). Only the awaiting-selection hold inspects this, to
+    tell "a real choice arrived" from "nobody ever answered" - see
+    _hold_awake_for_selection.
     """
     if not PUBLIC_URL:
-        return
+        return "disabled"
     limit = KEEPALIVE_MAX if max_seconds is None else max_seconds
     deadline = time.monotonic() + limit
     while not stop.wait(KEEPALIVE_INTERVAL):
@@ -527,7 +609,7 @@ def _keepalive(stop: threading.Event, run_id: str,
             _log(f"[keepalive] {run_id}: {limit:.0f}s deadline reached, "
                  f"stopping. The run is still going but will no longer hold "
                  f"the service awake.")
-            return
+            return "deadline"
         try:
             response = httpx.get(f"{PUBLIC_URL}/health", timeout=15.0)
             _log(f"[keepalive] {run_id}: GET {PUBLIC_URL}/health -> "
@@ -535,9 +617,56 @@ def _keepalive(stop: threading.Event, run_id: str,
         except Exception as exc:
             _log(f"[keepalive] {run_id}: GET {PUBLIC_URL}/health failed: "
                  f"{type(exc).__name__}: {exc}")
+    return "released"
 
 
-def _hold_awake_for_selection(run_id: str) -> None:
+def _auto_select_on_timeout(run_id: str, user_id: str) -> None:
+    """Nobody chose a volume before the awaiting-selection hold gave up.
+
+    CONFIRMED on a real run, 2026-09-27: [pipeline] awaiting selection: 434
+    postings collected, none scored, followed 30 minutes later by 1800s
+    deadline reached, stopping - and the run just sat there in
+    AWAITING_SELECTION forever, the ~$2.40 of Apify collection never scored.
+    Losing money that was already spent, for want of one more decision, is
+    worse than guessing - so this scores AUTO_SELECT_VOLUME_FRACTION of the
+    pool rather than leave it stranded.
+
+    Runs inline on the keepalive's own daemon thread, not backgrounded: that
+    thread exists only to hold the service awake and, now, to make this one
+    decision if nobody else does - blocking it for the length of the run is
+    exactly what it is for.
+    """
+    store = get_store()
+    record = store.get_run(user_id, run_id)
+    available = record.counts.get("available_to_score", 0) if record else 0
+    default_n = round(available * AUTO_SELECT_VOLUME_FRACTION)
+
+    try:
+        profile, secrets, opts, user_id = _resume_held_run(
+            run_id, user_id, max_jobs_to_score=default_n,
+            generate_text=True, auto=True)
+    except _ResumeRefused as exc:
+        _log(f"[auto-select] {run_id}: cannot auto-resume ({exc.status_code}): "
+             f"{exc.detail}")
+        return
+
+    _log(f"[auto-select] {run_id}: nobody chose a volume in "
+         f"{KEEPALIVE_AWAITING_MAX / 60:.0f} min; scoring {default_n}/"
+         f"{available} ({AUTO_SELECT_VOLUME_FRACTION:.0%}) automatically")
+    _execute(profile, store, secrets, opts, user_id, run_id)
+
+    # pipeline.run()'s own final save (jobscout/pipeline.py _finish) replaces
+    # counts wholesale with its freshly-recomputed dict - it has no notion of
+    # "auto" and would silently overwrite the marker set above. Re-stamp it on
+    # whatever _execute just wrote, so a run that reaches OK/FAILED still
+    # says how its volume was chosen.
+    final = store.get_run(user_id, run_id)
+    if final is not None:
+        store.save_run(final.model_copy(
+            update={"counts": {**final.counts, "volume_auto_selected": 1}}))
+
+
+def _hold_awake_for_selection(run_id: str, user_id: str) -> None:
     """Keep the service alive while a run waits for its volume to be chosen.
 
     This was originally left out, on the reasoning that the screen showing the
@@ -548,7 +677,9 @@ def _hold_awake_for_selection(run_id: str) -> None:
 
     The lesson is that the keepalive cannot depend on a frontend behaving as
     expected. It is bounded all the same: after KEEPALIVE_AWAITING_MAX nobody
-    is coming, and the 409 on /select covers the lost payload.
+    is coming, and _auto_select_on_timeout now covers the payload that would
+    otherwise be lost, rather than just the 409 that used to be the only
+    acknowledgment of it.
     """
     previous = _selection_holds.pop(run_id, None)
     if previous is not None:
@@ -559,8 +690,16 @@ def _hold_awake_for_selection(run_id: str) -> None:
 
     def hold() -> None:
         try:
-            _keepalive(release, f"{run_id} (awaiting selection)",
-                       max_seconds=KEEPALIVE_AWAITING_MAX)
+            outcome = _keepalive(release, f"{run_id} (awaiting selection)",
+                                 max_seconds=KEEPALIVE_AWAITING_MAX)
+            # Re-check that this hold is still the live one: a real /select
+            # call releases it (and _keepalive would then have returned
+            # "released", not "deadline"), but a wafer-thin window remains
+            # between the deadline firing and this line. If a concurrent
+            # caller already popped this exact hold, back off rather than
+            # risk scoring the same collection twice.
+            if outcome == "deadline" and _selection_holds.get(run_id) is release:
+                _auto_select_on_timeout(run_id, user_id)
         finally:
             # Never leave an entry behind for a hold that has ended, or the
             # registry grows for the life of the process.
@@ -615,7 +754,7 @@ def _execute(profile, store, secrets, opts: RunOptions,
     # The run is over, but a run parked at the pause is not finished with the
     # service: its payload has to survive until someone picks a volume.
     if report is not None and report.status == AWAITING_SELECTION:
-        _hold_awake_for_selection(run_id)
+        _hold_awake_for_selection(run_id, user_id)
 
 
 @app.get("/run/{run_id}", dependencies=[Protected])
@@ -629,9 +768,12 @@ def run_status(
     AWAITING_SELECTION / REJECTED_OVER_HARD_CAP / FAILED.
 
     On NEEDS_CONFIRMATION, resend POST /run with cost_fingerprint as
-    confirmed_fingerprint. On AWAITING_SELECTION, collection is done and paid
-    for and counts.available_to_score holds the real pool; POST
-    /run/{run_id}/select with the number to score.
+    confirmed_fingerprint AND scoring_percentage - both are decided together,
+    before collection. AWAITING_SELECTION should not occur for a run that set
+    scoring_percentage; it only appears for one that explicitly asked to
+    pause with select_after_collect, in which case counts.available_to_score
+    holds the real pool and POST /run/{run_id}/select takes the number to
+    score.
     """
     record = get_store().get_run(user_id, run_id)
     if record is None:

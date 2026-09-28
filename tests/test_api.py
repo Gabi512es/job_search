@@ -867,11 +867,14 @@ try:
                 headers=AUTH)
     check("choosing a volume releases the hold",
           paused_id in api_module._selection_holds, False)
+    check("a real choice is not marked as automatic",
+          api_module.get_store().get_run("hold-user", paused_id)
+          .counts.get("volume_auto_selected"), None)
 
     # Two pauses in a row must not stack holds for the same run.
     holds.clear()
-    api_module._hold_awake_for_selection("dup")
-    api_module._hold_awake_for_selection("dup")
+    api_module._hold_awake_for_selection("dup", "dup-user")
+    api_module._hold_awake_for_selection("dup", "dup-user")
     check("a repeated hold replaces rather than stacks",
           list(api_module._selection_holds), ["dup"])
     api_module._release_selection_hold("dup")
@@ -882,6 +885,135 @@ finally:
     api_module._keepalive = real_keepalive_2
     api_module.run_pipeline = real_pipeline
     api_module._selection_holds.clear()
+
+
+# ===========================================================================
+section("AUTO-SELECT ON TIMEOUT — nobody answers, so the paid collection "
+        "is not stranded")
+
+# -- _keepalive now names why it stopped -------------------------------------
+
+check("no PUBLIC_URL -> disabled, never treated as a timeout",
+      api_module._keepalive(_threading.Event(), "r", max_seconds=10), "disabled")
+
+_saved_ka = (api_module.PUBLIC_URL, api_module.httpx, api_module.KEEPALIVE_INTERVAL)
+api_module.PUBLIC_URL = "https://svc.onrender.com"
+api_module.httpx = FakeHttpx()
+api_module.KEEPALIVE_INTERVAL = 0.01
+try:
+    already_released = _threading.Event()
+    already_released.set()
+    check("stop set before the first wait -> released, not deadline",
+          api_module._keepalive(already_released, "r", max_seconds=10), "released")
+    check("the deadline reached first -> deadline",
+          api_module._keepalive(_threading.Event(), "r", max_seconds=0), "deadline")
+finally:
+    (api_module.PUBLIC_URL, api_module.httpx,
+     api_module.KEEPALIVE_INTERVAL) = _saved_ka
+
+# -- full timeout: auto-resumes at the recommended 70%, marks the counts ----
+
+_saved_auto = (api_module.PUBLIC_URL, api_module.httpx,
+              api_module.KEEPALIVE_INTERVAL, api_module.KEEPALIVE_AWAITING_MAX)
+api_module.PUBLIC_URL = "https://svc.onrender.com"
+api_module.httpx = FakeHttpx()
+api_module.KEEPALIVE_INTERVAL = 0.02
+api_module.KEEPALIVE_AWAITING_MAX = 0.05
+api_module.run_pipeline = collecting_pipeline
+try:
+    dump_dir = api_module.dumps_dir_for("auto-user")
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    (dump_dir / "linkedin_apify__gabriel.json").write_text("{}", encoding="utf-8")
+
+    selection_calls.clear()
+    r = client.post("/run", json={"profile_id": "gabriel", "reuse_dumps": True,
+                                  "select_after_collect": True,
+                                  "user_id": "auto-user"}, headers=AUTH)
+    run_id = r.json()["run_id"]
+    parked = api_module.get_store().get_run("auto-user", run_id)
+    check("the run parks at AWAITING_SELECTION first", parked.status,
+          "AWAITING_SELECTION")
+    check("with the real pool size recorded",
+          parked.counts.get("available_to_score"), 435)
+
+    # Give the hold's own daemon thread time to reach its (tiny) deadline and
+    # run the auto-resume, which itself re-invokes the (instant) stub.
+    _time.sleep(0.3)
+
+    final = api_module.get_store().get_run("auto-user", run_id)
+    check("the auto-resume reaches a terminal status", final.status, "OK")
+    check("marked as an automatic choice, not a real one",
+          final.counts.get("volume_auto_selected"), 1)
+    check("the marker survives the pipeline's own final save, which "
+          "otherwise replaces counts wholesale",
+          final.counts.get("available_to_score"), 435)
+    check("scored round(pool x 70%), the same recommended default as "
+          "Lovable's own selector",
+          selection_calls[-1]["opts"].max_jobs_to_score,
+          round(435 * api_module.AUTO_SELECT_VOLUME_FRACTION))
+    check("the hold is cleared once resolved",
+          run_id in api_module._selection_holds, False)
+finally:
+    (api_module.PUBLIC_URL, api_module.httpx, api_module.KEEPALIVE_INTERVAL,
+     api_module.KEEPALIVE_AWAITING_MAX) = _saved_auto
+    api_module.run_pipeline = real_pipeline
+
+# -- the payload is gone: log and give up, never fake a resume --------------
+
+_saved_nodump = (api_module.PUBLIC_URL, api_module.httpx,
+                 api_module.KEEPALIVE_INTERVAL, api_module.KEEPALIVE_AWAITING_MAX)
+api_module.PUBLIC_URL = "https://svc.onrender.com"
+api_module.httpx = FakeHttpx()
+api_module.KEEPALIVE_INTERVAL = 0.02
+api_module.KEEPALIVE_AWAITING_MAX = 0.05
+api_module.run_pipeline = collecting_pipeline
+try:
+    # Deliberately no dump file written for "auto-user-nodump".
+    r = client.post("/run", json={"profile_id": "gabriel", "reuse_dumps": True,
+                                  "select_after_collect": True,
+                                  "user_id": "auto-user-nodump"}, headers=AUTH)
+    run_id = r.json()["run_id"]
+    _time.sleep(0.3)
+    stuck = api_module.get_store().get_run("auto-user-nodump", run_id)
+    check("with no saved payload, the run stays AWAITING_SELECTION rather "
+          "than faking a resume or re-billing Apify",
+          stuck.status, "AWAITING_SELECTION")
+    check("the hold is still cleaned up even though it gave up",
+          run_id in api_module._selection_holds, False)
+finally:
+    (api_module.PUBLIC_URL, api_module.httpx, api_module.KEEPALIVE_INTERVAL,
+     api_module.KEEPALIVE_AWAITING_MAX) = _saved_nodump
+    api_module.run_pipeline = real_pipeline
+
+# -- race guard: a concurrent release right at the deadline wins -------------
+
+def racing_keepalive(stop, label, max_seconds=None):
+    """Simulates a real POST /select claiming the hold in the sliver of time
+    between the deadline firing and the guard in hold() checking it.
+
+    `label` is _keepalive's own decorated string ("race-run (awaiting
+    selection)"), not the bare registry key - the real run_id is closed over
+    below instead of parsed back out of it."""
+    api_module._selection_holds.pop("race-run", None)
+    return "deadline"
+
+
+auto_calls: list[tuple] = []
+saved_auto_fn = api_module._auto_select_on_timeout
+saved_keepalive_fn = api_module._keepalive
+api_module._auto_select_on_timeout = lambda *a, **k: auto_calls.append((a, k))
+api_module._keepalive = racing_keepalive
+try:
+    api_module._hold_awake_for_selection("race-run", "race-user")
+    _time.sleep(0.05)
+    check("a concurrent release right at the deadline suppresses auto-select",
+          auto_calls, [])
+    check("the registry entry is still cleaned up",
+          "race-run" in api_module._selection_holds, False)
+finally:
+    api_module._auto_select_on_timeout = saved_auto_fn
+    api_module._keepalive = saved_keepalive_fn
+    api_module._selection_holds.pop("race-run", None)
 
 
 # ===========================================================================

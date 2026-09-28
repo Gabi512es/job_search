@@ -407,6 +407,52 @@ check("with no cap, pool == to_score",
 check("and nothing was capped out", "capped_out" in report2.counts, False)
 
 
+section("SCORING_PERCENTAGE — the volume decided up front, against the real pool")
+
+# RSS is live, so every expectation below is a relation against the pool
+# actually returned this run, never a hardcoded total - same discipline as
+# AVAILABLE_TO_SCORE above.
+
+store4 = JsonStore(TMP / "pct")
+client4 = FakeClient(gabriel)
+report4 = run(replay, store4, Secrets.from_env(),
+              RunOptions(scoring_percentage=70, dumps_dir=DUMPS,
+                        generate_text=False),
+              user_id="pct-user", client=client4, repo_dir=REPO)
+pool4 = report4.counts["available_to_score"]
+check("resolves to round(pool x 70%), same formula as the auto-select fallback",
+      report4.counts["to_score"], round(pool4 * 70 / 100))
+check("the percentage is recorded, for the frontend to show after the fact",
+      report4.counts["scoring_percentage"], 70)
+check("only the resolved count was billed", client4.scoring_calls,
+      round(pool4 * 70 / 100))
+check("never reaches AWAITING_SELECTION: the choice is already made",
+      report4.status, CostDecision.OK.value)
+
+# max_jobs_to_score remains a hard ceiling ON TOP of the percentage - a typo
+# in a keyword list still cannot spend past it, whatever percentage was asked.
+store5 = JsonStore(TMP / "pct_capped")
+client5 = FakeClient(gabriel)
+report5 = run(replay, store5, Secrets.from_env(),
+              RunOptions(scoring_percentage=100, max_jobs_to_score=3,
+                        dumps_dir=DUMPS, generate_text=False),
+              user_id="pct-user-2", client=client5, repo_dir=REPO)
+check("max_jobs_to_score wins when it caps harder than the percentage",
+      report5.counts["to_score"], 3)
+check("the percentage is still recorded even though it did not bind",
+      report5.counts.get("scoring_percentage"), 100)
+
+# 0% is a legitimate, if unusual, choice: collect and count, score nothing.
+store6 = JsonStore(TMP / "pct_zero")
+client6 = FakeClient(gabriel)
+report6 = run(replay, store6, Secrets.from_env(),
+              RunOptions(scoring_percentage=0, dumps_dir=DUMPS,
+                        generate_text=False),
+              user_id="pct-user-3", client=client6, repo_dir=REPO)
+check("0% scores nothing, without erroring", report6.counts["to_score"], 0)
+check("no billed Haiku calls at 0%", client6.scoring_calls, 0)
+
+
 section("AWAITING_SELECTION — collected and paid for, not yet scored")
 
 store3 = JsonStore(TMP / "await")

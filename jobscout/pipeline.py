@@ -67,12 +67,29 @@ class RunOptions(BaseModel):
 
     # Safety rail for development: refuse to score more than this many jobs in
     # one run. A full LinkedIn + RSS run reaches ~450 postings, which is real
-    # money in Haiku calls; a typo in a keyword list should not spend it.
+    # money in Haiku calls; a typo in a keyword list should not spend it. Not
+    # the user-facing volume control - that is scoring_percentage, below. When
+    # both are set, whichever caps the pool harder wins.
     max_jobs_to_score: int | None = None
 
+    # The user's chosen volume, decided up front (alongside the collection
+    # cost confirmation) rather than after collection - see
+    # scoring_percentage below for why. None here means "no percentage was
+    # given", which for a direct pipeline.run() caller means uncapped except
+    # by max_jobs_to_score; the HTTP API defaults this to 70 at its own layer
+    # (api.py's RunRequest), the same way max_jobs_to_score's old default of
+    # 25 lived only in the API layer, never here.
+    scoring_percentage: int | None = None
+
     # Stop after collection, before any billed scoring call, and record the
-    # real pool size so the caller can choose a volume from it. Resuming is
-    # free: the paid Apify payload is replayed from its dump.
+    # real pool size so a later call can choose a volume from it. This is the
+    # mechanism scoring_percentage replaces as Lovable's default flow: the
+    # volume choice no longer waits on a response that might never arrive
+    # (see api.py's POST /run/{id}/select and its keepalive fallback). Kept as
+    # a general, opt-in capability rather than removed - nothing about it
+    # conflicts with scoring_percentage, since a caller would only ever set
+    # one or the other. Resuming is free: the paid Apify payload is replayed
+    # from its dump.
     select_after_collect: bool = False
 
     export_xlsx_path: str | None = None
@@ -233,12 +250,23 @@ def run(
         return _awaiting_report(run_id, profile, store, user_id, started,
                                 collection, counts)
 
-    if opts.max_jobs_to_score is not None and len(jobs) > opts.max_jobs_to_score:
-        _log(f"[pipeline] capping {len(jobs)} jobs at "
-             f"{opts.max_jobs_to_score} (max_jobs_to_score), "
+    # The volume choice, resolved against the real pool now that it is known.
+    # Made up front (scoring_percentage) rather than after a pause that might
+    # never get answered; max_jobs_to_score remains a hard ceiling on top,
+    # never relaxed by a percentage.
+    effective_cap = opts.max_jobs_to_score
+    if opts.scoring_percentage is not None:
+        pct_cap = round(counts["available_to_score"] * opts.scoring_percentage / 100)
+        counts["scoring_percentage"] = opts.scoring_percentage
+        _log(f"[pipeline] scoring_percentage={opts.scoring_percentage}% of "
+             f"{counts['available_to_score']} available -> {pct_cap}")
+        effective_cap = pct_cap if effective_cap is None else min(effective_cap, pct_cap)
+
+    if effective_cap is not None and len(jobs) > effective_cap:
+        _log(f"[pipeline] capping {len(jobs)} jobs at {effective_cap}, "
              f"interleaved so every source is represented")
-        counts["capped_out"] = len(jobs) - opts.max_jobs_to_score
-        jobs = jobs[:opts.max_jobs_to_score]
+        counts["capped_out"] = len(jobs) - effective_cap
+        jobs = jobs[:effective_cap]
 
     counts["to_score"] = len(jobs)
     _log(f"[pipeline] {len(jobs)} jobs to score")
