@@ -373,6 +373,32 @@ print(f"\n  gabriel prompt {len(g_prompt)} chars | camila prompt {len(c_prompt)}
 
 
 # ===========================================================================
+section("SYSTEM PROMPT — dated-qualification reasoning, added 2026-09-30")
+#
+# CONFIRMED on a real candidate: with no anchor date, the model has no way to
+# tell whether a future "valid from <date>" has already arrived, and inverted
+# it into "valid UNTIL <date>" in a red_flag - wrongly implying an already-
+# valid qualification had expired. build_eval_system now injects today's date
+# and an explicit from/until distinction.
+
+from datetime import date  # noqa: E402
+
+fixed_today = date(2026, 9, 30)
+sys_with_date = build_eval_system(gabriel, today=fixed_today)
+check("today's date is injected, not left for the model to guess",
+      "2026-09-30" in sys_with_date, True)
+check("the from/until directions are both named explicitly",
+      "Valid from" in sys_with_date and "Valid until" in sys_with_date, True)
+check("warns against inverting one into the other",
+      "do not invert" in sys_with_date, True)
+check("a passed 'today' is used verbatim, not silently replaced",
+      build_eval_system(gabriel, today=date(2020, 1, 1)) !=
+      build_eval_system(gabriel, today=date(2030, 1, 1)), True)
+check("with no 'today' given, the real current date is used",
+      date.today().isoformat() in build_eval_system(gabriel), True)
+
+
+# ===========================================================================
 section("PROMPT — built from real jobs in the saved dumps (no API call)")
 
 conns_c = build_connectors(camila, REPO / "dumps")

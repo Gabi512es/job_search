@@ -16,6 +16,7 @@ disagree.
 from __future__ import annotations
 
 import json
+from datetime import date
 
 from jobscout.jobs import JobPosting
 from jobscout.profile import UserProfile
@@ -32,11 +33,18 @@ CORE_TEXT_FIELDS = {
 MAX_DESCRIPTION_CHARS = 3000
 
 
-def build_eval_system(profile: UserProfile) -> str:
-    """System prompt. States the job and the calibration, nothing numeric."""
+def build_eval_system(profile: UserProfile, today: date | None = None) -> str:
+    """System prompt. States the job and the calibration, nothing numeric.
+
+    `today` is injectable for deterministic tests; production leaves it None
+    and gets the real date. It exists because of a dated-qualification
+    reasoning bug found on a real run (2026-09-29): with no anchor date, the
+    model cannot tell whether a future "valid from" date has already arrived.
+    """
     language = {
         "en": "English", "es": "Spanish", "fr": "French", "ca": "Catalan",
     }.get(profile.language, "English")
+    today = today or date.today()
 
     return (
         "You are a rigorous job-fit assessor for one specific candidate.\n"
@@ -47,6 +55,18 @@ def build_eval_system(profile: UserProfile) -> str:
         "Score honestly and do not inflate. Most real postings land in the 4-7 "
         "band on any given dimension. Reserve 9-10 for genuinely exceptional "
         "matches and 0-2 for clear mismatches.\n"
+        f"Today's date is {today.isoformat()}.\n"
+        "CONFIRMED on a real candidate: when the CV or posting mentions a date "
+        "for when a qualification, certification, right to work, degree "
+        "equivalency or similar becomes valid or expires, reason carefully "
+        "about DIRECTION before writing it into gaps or red_flags. "
+        "\"Valid from <date>\" or \"available from <date>\" means valid/"
+        "available ON and AFTER that date - if that date is on or before "
+        "today (above), it IS currently valid, not a limitation. \"Valid "
+        "until <date>\" or \"expires <date>\" means the opposite: no longer "
+        "valid after that date. These are not interchangeable - do not "
+        "invert one into the other, and do not flag a \"valid from\" date "
+        "that has already arrived as if it were still pending.\n"
         f"Write all free-text fields in {language}.\n"
         "Return ONLY one valid JSON object. No markdown, no code fence, no preamble."
     )
