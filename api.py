@@ -30,6 +30,11 @@ works after a redeploy and two instances see the same thing.
                             engine_scoring_profile - works before one exists
                             (onboarding) and again later to regenerate from
                             "Mon profil". Writes nothing.
+    POST /suggest-scoring-criteria  dimensions + rédhibitoire flags from a
+                            CV, replacing the generic MVP profile with a
+                            real per-candidate rubric. Same independence and
+                            "writes nothing" contract as /suggest-keywords.
+                            SPENDS SONNET, not Apify.
 
 Every route except /health and / requires the X-API-Key header. This endpoint
 starts paid Haiku and Apify calls, so an unauthenticated one would let anyone
@@ -58,8 +63,11 @@ from jobscout.connectors.base import DumpStore
 from jobscout.keyword_suggestions import ResponseError, suggest_keywords
 from jobscout.pipeline import AWAITING_SELECTION, RunOptions, run as run_pipeline
 from jobscout.profile import (
-    BUDGET_TIERS, PAID_SOURCE_TYPES, EngineProfileError, UserProfile,
-    load_profile, profile_from_engine,
+    BUDGET_TIERS, PAID_SOURCE_TYPES, EngineProfileError, LlmFlag,
+    ScoringDimension, UserProfile, load_profile, profile_from_engine,
+)
+from jobscout.scoring_criteria_suggestions import (
+    ResponseError as CriteriaResponseError, suggest_scoring_criteria,
 )
 from jobscout.store.base import RunRecord
 from jobscout.store.json_store import JsonStore
@@ -351,6 +359,40 @@ class SuggestKeywordsResponse(BaseModel):
     suggestions: list[str]
 
 
+class SuggestScoringCriteriaRequest(BaseModel):
+    user_id: str | None = Field(
+        default=None,
+        description=("Row owner, a Supabase auth uuid. Required when "
+                     "STORE_BACKEND=lovable and cv_text is not given "
+                     "directly, since cv_text is then read for this user."),
+    )
+    cv_text: str | None = Field(
+        default=None,
+        description=("Overrides whatever cv_text is stored for user_id - use "
+                     "this to suggest from CV text just pasted or "
+                     "re-uploaded but not yet saved."),
+    )
+    search_keywords: list[str] = Field(
+        default_factory=list,
+        description=("The broad keywords already chosen (from /suggest-"
+                     "keywords or typed manually), if any. Anchors the "
+                     "dimensions on the right field rather than reading the "
+                     "CV blind. Optional."),
+    )
+    language: str | None = Field(
+        default=None,
+        description=("Language for labels/rubrics/definitions themselves "
+                     "(\"en\", \"es\", \"fr\", \"ca\", or any language "
+                     "name). None lets the model infer it from the CV's "
+                     "own language."),
+    )
+
+
+class SuggestScoringCriteriaResponse(BaseModel):
+    dimensions: list[ScoringDimension]
+    llm_flags: list[LlmFlag]
+
+
 class RunAccepted(BaseModel):
     run_id: str
     status: Literal["RUNNING"] = "RUNNING"
@@ -408,7 +450,8 @@ def root() -> dict:
         "service": "Job Scout engine",
         "runs_are": "asynchronous — POST /run returns a run_id, then poll GET /run/{run_id}",
         "routes": ["/health", "/estimate", "/run", "/run/{run_id}",
-                   "/run/{run_id}/select", "/results", "/suggest-keywords"],
+                   "/run/{run_id}/select", "/results", "/suggest-keywords",
+                   "/suggest-scoring-criteria"],
         "auth": "X-API-Key header on every route except /health and /",
     }
 
@@ -830,6 +873,44 @@ def results(
     }
 
 
+def _resolve_cv_text(cv_text_override: str | None, user_id: str | None) -> str:
+    """Shared by every /suggest-* route: none of them depend on
+    engine_scoring_profile, and all of them need cv_text the same way."""
+    cv_text = cv_text_override
+    if not cv_text:
+        if STORE_BACKEND not in ("supabase", "lovable"):
+            raise HTTPException(
+                status_code=422,
+                detail=("cv_text must be given directly: STORE_BACKEND=json "
+                        "has no get-profile route to read it from."))
+        if not user_id:
+            raise HTTPException(
+                status_code=422,
+                detail="user_id is required when cv_text is not given directly.")
+        row = get_store().get_profile(user_id)
+        cv_text = row.get("cv_text") if isinstance(row, dict) else None
+
+    if not isinstance(cv_text, str) or not cv_text.strip():
+        raise HTTPException(
+            status_code=422,
+            detail=(f"no usable cv_text for {user_id!r}. Generating "
+                    f"suggestions from an empty CV would be meaningless, so "
+                    f"this refuses rather than guessing."))
+    return cv_text.strip()
+
+
+def _anthropic_client():
+    """Shared by every /suggest-* route. Raises 503 rather than letting a
+    later AttributeError/auth error look like a generation failure."""
+    secrets = Secrets.from_env()
+    if not secrets.anthropic_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="ANTHROPIC_API_KEY is not configured on the server.")
+    import anthropic
+    return anthropic.Anthropic(api_key=secrets.anthropic_api_key)
+
+
 @app.post("/suggest-keywords", dependencies=[Protected])
 def suggest_keywords_route(request: SuggestKeywordsRequest) -> SuggestKeywordsResponse:
     """Propose 3-5 broad keyword/job-title suggestions from a CV.
@@ -845,41 +926,58 @@ def suggest_keywords_route(request: SuggestKeywordsRequest) -> SuggestKeywordsRe
     specifically - this is a single small call, not a per-posting or
     per-search-URL cost.
     """
-    cv_text = request.cv_text
-    if not cv_text:
-        if STORE_BACKEND not in ("supabase", "lovable"):
-            raise HTTPException(
-                status_code=422,
-                detail=("cv_text must be given directly: STORE_BACKEND=json "
-                        "has no get-profile route to read it from."))
-        if not request.user_id:
-            raise HTTPException(
-                status_code=422,
-                detail="user_id is required when cv_text is not given directly.")
-        row = get_store().get_profile(request.user_id)
-        cv_text = row.get("cv_text") if isinstance(row, dict) else None
-
-    if not isinstance(cv_text, str) or not cv_text.strip():
-        raise HTTPException(
-            status_code=422,
-            detail=(f"no usable cv_text for {request.user_id!r}. Generating "
-                    f"suggestions from an empty CV would be meaningless, so "
-                    f"this refuses rather than guessing."))
-
-    secrets = Secrets.from_env()
-    if not secrets.anthropic_api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="ANTHROPIC_API_KEY is not configured on the server.")
-
-    import anthropic
-    client = anthropic.Anthropic(api_key=secrets.anthropic_api_key)
+    cv_text = _resolve_cv_text(request.cv_text, request.user_id)
+    client = _anthropic_client()
     try:
         suggestions = suggest_keywords(
-            client, cv_text.strip(), language=request.language)
+            client, cv_text, language=request.language)
     except ResponseError as exc:
         raise HTTPException(
             status_code=502,
             detail=f"could not generate keyword suggestions: {exc}") from exc
 
     return SuggestKeywordsResponse(suggestions=suggestions)
+
+
+@app.post("/suggest-scoring-criteria", dependencies=[Protected])
+def suggest_scoring_criteria_route(
+    request: SuggestScoringCriteriaRequest,
+) -> SuggestScoringCriteriaResponse:
+    """Propose scoring dimensions and rédhibitoire flags from a CV.
+
+    Replaces the one-dimension MVP profile with a real, per-candidate rubric
+    without ever hand-writing one again (the reason this exists: a generic
+    "general_fit" dimension gave one real candidate 0 "Fuertes" out of 354
+    postings and a ceiling score of 7 - the rubric captured nothing specific
+    to her field). Same independence from engine_scoring_profile as
+    /suggest-keywords, same "propose, never apply" contract: this route
+    writes nothing, and the caller decides what to keep, adjust or discard
+    before ever saving a profile.
+
+    dimensions and llm_flags are exactly ScoringDimension and LlmFlag -
+    already schema-conformant, never a separate shape to convert. Weights
+    always sum to 1.0 (computed in Python from the model's 1-5 importance,
+    never asked of the model directly) and flag severities map to fixed
+    adjustment values, not whatever number one particular call invented.
+
+    Deliberately never generates ExclusionRule or KeywordPenalty (the
+    schema's two keyword-driven hard filters): those need an exact keyword
+    list a free-text CV cannot reliably supply, and a wrong one would
+    silently exclude good matches with nothing to show for it.
+
+    Billed: one Sonnet call, not gated by cost_guard.py - see
+    /suggest-keywords for the same reasoning.
+    """
+    cv_text = _resolve_cv_text(request.cv_text, request.user_id)
+    client = _anthropic_client()
+    try:
+        result = suggest_scoring_criteria(
+            client, cv_text,
+            search_keywords=request.search_keywords or None,
+            language=request.language)
+    except CriteriaResponseError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"could not generate scoring criteria: {exc}") from exc
+
+    return SuggestScoringCriteriaResponse(**result)

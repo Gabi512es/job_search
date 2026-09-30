@@ -93,6 +93,7 @@ for method, path, payload in (
     ("get", "/run/abc?user_id=gabriel", None),
     ("get", "/results?user_id=gabriel", None),
     ("post", "/suggest-keywords", {"cv_text": "some cv"}),
+    ("post", "/suggest-scoring-criteria", {"cv_text": "some cv"}),
 ):
     call = getattr(client, method)
     r = call(path, json=payload) if payload else call(path)
@@ -667,6 +668,104 @@ try:
           "model would not cooperate" in r.json()["detail"], True)
 finally:
     api_module.suggest_keywords = real_suggest_keywords
+
+
+# ===========================================================================
+section("SUGGEST-SCORING-CRITERIA — dimensions + flags, exact schema shape")
+
+FAKE_CRITERIA = {
+    "dimensions": [
+        {"key": "field_experience", "label": "Field experience",
+         "weight": 0.6, "rubric": "- 9-10: a\n- 7-8: b\n- 5-6: c\n- 3-4: d\n- 0-2: e"},
+        {"key": "language_fit", "label": "Language fit",
+         "weight": 0.4, "rubric": "- 9-10: a\n- 7-8: b\n- 5-6: c\n- 3-4: d\n- 0-2: e"},
+    ],
+    "llm_flags": [
+        {"key": "requires_catalan", "definition": "Set true if Catalan is required",
+         "adjustment": -3.0, "note": "Requires Catalan", "target": "red_flags"},
+    ],
+}
+
+fake_criteria_calls: list[dict] = []
+real_suggest_scoring_criteria = api_module.suggest_scoring_criteria
+
+
+def fake_suggest_scoring_criteria(client, cv_text, *, search_keywords=None,
+                                  language=None, **kwargs):
+    fake_criteria_calls.append({
+        "cv_text": cv_text, "search_keywords": search_keywords, "language": language,
+    })
+    return FAKE_CRITERIA
+
+
+api_module.suggest_scoring_criteria = fake_suggest_scoring_criteria
+try:
+    fake_criteria_calls.clear()
+    r = client.post("/suggest-scoring-criteria",
+                    json={"cv_text": "Some CV body."}, headers=AUTH)
+    check("200 with cv_text given directly", r.status_code, 200)
+    body = r.json()
+    check("two dimensions come back, schema-shaped",
+          [d["key"] for d in body["dimensions"]],
+          ["field_experience", "language_fit"])
+    check("weights are preserved exactly",
+          [d["weight"] for d in body["dimensions"]], [0.6, 0.4])
+    check("one flag comes back, schema-shaped",
+          body["llm_flags"][0]["key"], "requires_catalan")
+    check("the given cv_text reaches the generator",
+          fake_criteria_calls[-1]["cv_text"], "Some CV body.")
+    check("no search_keywords -> None, not an empty list forwarded oddly",
+          fake_criteria_calls[-1]["search_keywords"], None)
+
+    r = client.post("/suggest-scoring-criteria",
+                    json={"cv_text": "Some CV body.",
+                          "search_keywords": ["Educación social"],
+                          "language": "es"},
+                    headers=AUTH)
+    check("search_keywords and language are forwarded",
+          (fake_criteria_calls[-1]["search_keywords"],
+           fake_criteria_calls[-1]["language"]),
+          (["Educación social"], "es"))
+
+    # -- lovable mode, cv_text read from the store (same helper as keywords)
+    store = FakeStore(row=engine_row())
+    previous = with_lovable(store)
+    try:
+        fake_criteria_calls.clear()
+        r = client.post("/suggest-scoring-criteria",
+                        json={"user_id": "u-1"}, headers=AUTH)
+        check("200 reading cv_text from get-profile", r.status_code, 200)
+        check("the route's own cv_text reaches the generator",
+              fake_criteria_calls[-1]["cv_text"], CV)
+    finally:
+        restore(previous)
+
+    # -- json mode, no cv_text given: same refusal as /suggest-keywords ----
+    r = client.post("/suggest-scoring-criteria",
+                    json={"user_id": "gabriel"}, headers=AUTH)
+    check("json mode with no cv_text -> 422", r.status_code, 422)
+    check("and explains there is no get-profile route to read it from",
+          "no get-profile route" in r.json()["detail"], True)
+finally:
+    api_module.suggest_scoring_criteria = real_suggest_scoring_criteria
+
+# -- the generator itself failing surfaces as 502 ---------------------------
+
+
+def failing_suggest_scoring_criteria(client, cv_text, *, search_keywords=None,
+                                     language=None, **kwargs):
+    raise api_module.CriteriaResponseError("model would not cooperate")
+
+
+api_module.suggest_scoring_criteria = failing_suggest_scoring_criteria
+try:
+    r = client.post("/suggest-scoring-criteria",
+                    json={"cv_text": "Some CV body."}, headers=AUTH)
+    check("a generation failure is a 502", r.status_code, 502)
+    check("naming what went wrong",
+          "model would not cooperate" in r.json()["detail"], True)
+finally:
+    api_module.suggest_scoring_criteria = real_suggest_scoring_criteria
 
 
 # ===========================================================================
